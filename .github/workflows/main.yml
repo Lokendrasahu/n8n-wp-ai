@@ -94,7 +94,10 @@ jobs:
                    const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
                    if(error) { console.log("⚠️ Fresh Start (No Backup Found)"); return; }
                    fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
+                   
+                   // ✅ OPTIMIZATION 1: Performance Tuning for SQLite
                    try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
+                   try { execSync("sqlite3 " + live + " 'PRAGMA synchronous=NORMAL;'"); } catch(e) {}
                 });
               } else {
                 if(!fs.existsSync(live)) return;
@@ -185,6 +188,7 @@ jobs:
             -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=24 \
             -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
+            -e N8N_LOG_LEVEL=warn \
             n8nio/n8n
 
           # WhatsApp Service (Original Hybrid Auth & Reset Logic)
@@ -325,39 +329,39 @@ jobs:
           
           START=$(date +%s)
           while true; do
-              NOW=$(date +%s); DIFF=$((NOW - START))
-              
-              # 🚫 CONSTRAINT 5: 21000s Limit
-              if [ $DIFF -ge 21000 ]; then
-                  echo "⏰ Time limit reached (21000s). Initiating Handover..."
-                  
-                  # 🟢 FIX 2: Handover Resilience
-                  # "|| echo..." ensures script doesn't crash if API has a hiccup
-                  gh workflow run main.yml || echo "⚠️ Handover Trigger Failed (Check GH_PAT)"
-                  
-                  echo "✅ Next bot triggered"
-                  node smart_sync.js up
-                  echo "✅ Data Saved"
-                  echo "👋 Exiting cleanly."
-                  
-                  # 🟢 Disable Trap before clean exit to essentially "Unsubscribe" from the error handler
-                  trap - EXIT
-                  exit 0
-              fi
-              
-              # Health Checks
-              if ! docker exec ai-server curl -s http://localhost:5000/health >/dev/null; then docker restart ai-server; fi
-              if ! docker exec wa-bot curl -s http://localhost:10000/health >/dev/null; then 
-                  if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
-              fi
-              if ! docker ps | grep -q n8n; then docker restart n8n; fi
+             NOW=$(date +%s); DIFF=$((NOW - START))
+             
+             # 🚫 CONSTRAINT 5: 21000s Limit
+             if [ $DIFF -ge 21000 ]; then
+                 echo "⏰ Time limit reached (21000s). Initiating Handover..."
+                 
+                 # 🟢 FIX 2: Handover Resilience
+                 # "|| echo..." ensures script doesn't crash if API has a hiccup
+                 gh workflow run main.yml || echo "⚠️ Handover Trigger Failed (Check GH_PAT)"
+                 
+                 echo "✅ Next bot triggered"
+                 node smart_sync.js up
+                 echo "✅ Data Saved"
+                 echo "👋 Exiting cleanly."
+                 
+                 # 🟢 Disable Trap before clean exit to essentially "Unsubscribe" from the error handler
+                 trap - EXIT
+                 exit 0
+             fi
+             
+             # Health Checks
+             if ! docker exec ai-server curl -s http://localhost:5000/health >/dev/null; then docker restart ai-server; fi
+             if ! docker exec wa-bot curl -s http://localhost:10000/health >/dev/null; then 
+                 if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
+             fi
+             if ! docker ps | grep -q n8n; then docker restart n8n; fi
 
-              # Backup every 15 mins
-              if [ $DIFF -gt 100 ] && [ $((DIFF % 900)) -lt 10 ]; then 
-                  node smart_sync.js up
-              fi
-              
-              echo "💓 Alive: ${DIFF}s / 21000s"; sleep 60
+             # Backup every 15 mins
+             if [ $DIFF -gt 100 ] && [ $((DIFF % 900)) -lt 10 ]; then 
+                 node smart_sync.js up
+             fi
+             
+             echo "💓 Alive: ${DIFF}s / 21000s"; sleep 60
           done
 
       - name: 🚨 Notify Failure
