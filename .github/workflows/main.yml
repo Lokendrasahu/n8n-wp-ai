@@ -16,12 +16,16 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: ⚡ Optimize Environment
+      - name: ⚡ Optimize Environment & Install Tools
         run: |
           sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          # 🟢 FIXED: Ngrok & System Tools Installation
           sudo apt-get update && sudo apt-get install -y sqlite3 curl ffmpeg
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update && sudo apt-get install -y ngrok
           npm install @supabase/supabase-js
-          echo "✅ System Tuned"
+          echo "✅ System Ready"
 
       - name: 💾 Setup Data Layer & Pre-Run Backup
         env:
@@ -49,12 +53,14 @@ jobs:
                 }
               } else {
                 if(!fs.existsSync(live)) return;
+                // ✅ Merge WAL before backup
                 try { execSync("sqlite3 " + live + " 'PRAGMA wal_checkpoint(FULL);'"); } catch(e) {}
                 if(fs.existsSync(safe)) fs.unlinkSync(safe);
                 execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
+                
                 const { error } = await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
                 if(!error && process.env.TG_TOKEN) {
-                    const caption = "🚀 <b>HEALTHY BACKUP READY</b>\n📂 Use for Hugging Face.";
+                    const caption = "🚀 <b>HEALTHY BACKUP READY</b>\n📂 Perfect for Hugging Face.";
                     spawnSync("curl", ["-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@${safe};filename=n8n_healthy.sqlite`, "-F", `caption=${caption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`]);
                 }
               }
@@ -77,7 +83,7 @@ jobs:
           docker network create bot-net || true
           ngrok config add-authtoken $NGROK_TOKEN
           ngrok http --domain=$NGROK_DOMAIN 80 > /dev/null &
-          sleep 5
+          sleep 10
 
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
@@ -85,17 +91,14 @@ jobs:
             -e WEBHOOK_URL="https://$NGROK_DOMAIN" \
             n8nio/n8n
 
-          # Yahan aap apne baaki ke Docker containers (WA, AI) bhi add kar sakte hain
-
       - name: 🔄 Observer & Auto-Sync
         env:
-          # 🟢 FIX: Important variables passed to the loop
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
         run: |
           START=$(date +%s)
           while true; do
