@@ -16,9 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      # 1️⃣ LIGHT ENV SETUP
+      # 1️⃣ SAFE DISK SWAP + MINIMAL SETUP
       - name: ⚡ Minimal Setup
         run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile || true
+
           sudo fallocate -l 2G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
@@ -34,14 +37,14 @@ jobs:
 
           npm install @supabase/supabase-js
 
-      # 2️⃣ CACHE (ONLY WHAT MATTERS)
+      # 2️⃣ CACHE (ONLY WA BOT)
       - name: 📦 Cache WA Modules
         uses: actions/cache@v3
         with:
           path: whatsapp/node_modules
           key: wa-cache-${{ runner.os }}
 
-      # 3️⃣ SMART SYNC (UNCHANGED CORE LOGIC)
+      # 3️⃣ SMART BACKUP SYNC
       - name: 💾 Smart Sync
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
@@ -78,7 +81,7 @@ jobs:
           node smart_sync.js down
           sudo chmod -R 777 n8n_data
 
-      # 4️⃣ LAUNCH SERVICES (LIGHT VERSION)
+      # 4️⃣ LAUNCH SERVICES
       - name: 🚀 Launch Services
         env:
           NGROK_AUTH: ${{ secrets.NGROK_TOKEN }}
@@ -91,7 +94,7 @@ jobs:
           ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > /dev/null &
           sleep 5
 
-          # n8n (memory reduced)
+          # n8n (low memory)
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
@@ -106,7 +109,7 @@ jobs:
             -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
             node:20-alpine sh -c "npm install && node index.js"
 
-          # Caddy
+          # Caddy Proxy
           printf ":80 {\n reverse_proxy /qr wa-bot:10000\n reverse_proxy /reset wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
 
           docker run -d --name caddy --network bot-net -p 80:80 \
@@ -117,7 +120,7 @@ jobs:
             -d chat_id=$TG_ID \
             -d text="🟢 UltraLight System Online"
 
-      # 5️⃣ OBSERVER LOOP (SIMPLIFIED + LIGHT)
+      # 5️⃣ OBSERVER LOOP
       - name: 🔄 Observer
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -150,4 +153,4 @@ jobs:
         run: |
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage \
             -d chat_id=$TG_ID \
-            -d text="⚠️ Crash detected"
+            -d text="⚠️ Bot crashed"
