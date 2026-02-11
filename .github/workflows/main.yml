@@ -1,4 +1,4 @@
-name: "Production UltraLight"
+name: "Production UltraLight FINAL"
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      # 1️⃣ SAFE DISK SWAP + MINIMAL SETUP
+      # 1️⃣ SAFE SWAP + MINIMAL SETUP
       - name: ⚡ Minimal Setup
         run: |
           sudo swapoff /swapfile 2>/dev/null || true
@@ -37,14 +37,14 @@ jobs:
 
           npm install @supabase/supabase-js
 
-      # 2️⃣ CACHE (ONLY WA BOT)
+      # 2️⃣ CACHE
       - name: 📦 Cache WA Modules
         uses: actions/cache@v3
         with:
           path: whatsapp/node_modules
           key: wa-cache-${{ runner.os }}
 
-      # 3️⃣ SMART BACKUP SYNC
+      # 3️⃣ SMART SYNC (unchanged stable logic)
       - name: 💾 Smart Sync
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
@@ -57,10 +57,7 @@ jobs:
           const fs = require('fs');
           const { execSync } = require('child_process');
 
-          const sbUrl = process.env.SUPABASE_URL;
-          if (!sbUrl || !sbUrl.startsWith('http')) process.exit(1);
-
-          const sb = createClient(sbUrl, process.env.SUPABASE_KEY);
+          const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
           const live='n8n_data/database.sqlite', safe='n8n_data/db_snap.sqlite';
 
           async function run(mode) {
@@ -73,7 +70,7 @@ jobs:
                 execSync(`sqlite3 ${live} ".backup '${safe}'"`);
                 await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               }
-            } catch(e) {}
+            } catch(e){}
           }
           run(process.argv[2]);
           EOF
@@ -81,23 +78,27 @@ jobs:
           node smart_sync.js down
           sudo chmod -R 777 n8n_data
 
-      # 4️⃣ LAUNCH SERVICES
+      # 4️⃣ LAUNCH SERVICES (🔥 FIXED)
       - name: 🚀 Launch Services
         env:
           NGROK_AUTH: ${{ secrets.NGROK_TOKEN }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          docker rm -f n8n wa-bot caddy 2>/dev/null || true
           docker network create bot-net || true
 
           ngrok config add-authtoken $NGROK_AUTH
           ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > /dev/null &
-          sleep 5
+          sleep 8
 
-          # n8n (low memory)
+          # ✅ n8n (OLD WORKING FLAGS RESTORED)
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
+            -e WEBHOOK_URL="https://${{ secrets.NGROK_DOMAIN }}" \
+            -e N8N_SECURE_COOKIE=false \
+            -e N8N_BLOCK_ENV_ACCESS_IN_NODE=false \
             -e NODE_OPTIONS="--max-old-space-size=1024" \
             -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
             -e N8N_LOG_LEVEL=error \
@@ -107,10 +108,10 @@ jobs:
           docker run -d --name wa-bot --network bot-net --restart unless-stopped \
             -v $(pwd)/whatsapp:/app -w /app \
             -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
-            node:20-alpine sh -c "npm install && node index.js"
+            node:20-alpine sh -c "npm install && while true; do node index.js; sleep 2; done"
 
-          # Caddy Proxy
-          printf ":80 {\n reverse_proxy /qr wa-bot:10000\n reverse_proxy /reset wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
+          # Caddy
+          printf ":80 {\n reverse_proxy /qr wa-bot:10000\n reverse_proxy /reset wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
 
           docker run -d --name caddy --network bot-net -p 80:80 \
             -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile \
@@ -118,9 +119,9 @@ jobs:
 
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage \
             -d chat_id=$TG_ID \
-            -d text="🟢 UltraLight System Online"
+            -d text="🟢 UltraLight FINAL Online"
 
-      # 5️⃣ OBSERVER LOOP
+      # 5️⃣ OBSERVER LOOP (same safe logic)
       - name: 🔄 Observer
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -139,8 +140,8 @@ jobs:
               exit 0
             fi
 
-            if ! docker ps | grep -q n8n; then docker restart n8n; fi
-            if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
+            docker exec wa-bot curl -s http://localhost:10000/health >/dev/null || docker restart wa-bot
+            docker ps | grep -q n8n || docker restart n8n
 
             sleep 60
           done
