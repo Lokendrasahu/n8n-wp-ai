@@ -295,10 +295,14 @@ jobs:
              echo "📦 Zipping with Password..."
              zip -P "$BACKUP_PASS" n8n_data/n8n_secrets.zip n8n_data/creds_decrypted.json n8n_data/workflows.json
              
-             # 4. Send to Telegram
+             # 4. Send to Telegram (Fixed Caption formatting)
              echo "🚀 Sending to Telegram..."
+             
+             # Message ko proper format me set kiya (Bash style newlines)
+             CAPTION=$'🔐 <b>n8n Secrets Backup</b>\nPassword: <code>'$BACKUP_PASS'</code>'
+             
              curl -s -F "chat_id=$TG_ID" \
-                  -F "caption=🔐 <b>n8n Secrets Backup</b>%0A(Decrypted JSON)%0APassword: <code>$BACKUP_PASS</code>" \
+                  -F "caption=$CAPTION" \
                   -F "document=@n8n_data/n8n_secrets.zip" \
                   -F "parse_mode=HTML" \
                   https://api.telegram.org/bot$TG_TOKEN/sendDocument
