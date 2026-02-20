@@ -118,7 +118,7 @@ jobs:
       # ==================================================================
       # 4. LAUNCH SERVICES (MULTI-VENDOR)
       # ==================================================================
-      - name: 🚀 Launch Bot Swarm
+ 		      - name: 🚀 Launch Bot Swarm
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -126,14 +126,13 @@ jobs:
         run: |
           docker network create bot-net || true
           
-      # Start Ngrok
-      ngrok config add-authtoken $NGROK_AUTH
-      ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 \
-        --request-header-add ngrok-skip-browser-warning:true > /dev/null &
-      sleep 5
-
+          # Start Ngrok (SAHI - andar indentation 10 spaces)
+          ngrok config add-authtoken $NGROK_AUTH
+          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 \
+            --request-header-add ngrok-skip-browser-warning:true > /dev/null &
+          sleep 5
           
-          # Start n8n
+          # Start n8n (baaki sab same)
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
