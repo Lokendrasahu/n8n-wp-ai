@@ -31,7 +31,7 @@ jobs:
           # Minimal Dependencies
           sudo apt-get update && sudo apt-get install -y sqlite3 curl
           
-          # Ngrok Setup
+          # Ngrok Setup (Clean URLs)
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt-get update && sudo apt-get install -y ngrok
@@ -138,7 +138,8 @@ jobs:
           
           # Start Ngrok
           ngrok config add-authtoken $NGROK_AUTH
-          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > /dev/null &
+          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 \
+            --request-header-add ngrok-skip-browser-warning:true > /dev/null &
           sleep 5
           
           # Start n8n
