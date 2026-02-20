@@ -126,10 +126,12 @@ jobs:
         run: |
           docker network create bot-net || true
           
-          # Start Ngrok
-          ngrok config add-authtoken $NGROK_AUTH
-          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > /dev/null &
-          sleep 5
+      # Start Ngrok
+      ngrok config add-authtoken $NGROK_AUTH
+      ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 \
+        --request-header-add ngrok-skip-browser-warning:true > /dev/null &
+      sleep 5
+
           
           # Start n8n
           docker run -d --name n8n --network bot-net --restart unless-stopped \
