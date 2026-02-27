@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v3
 
       # ==================================================================
-      # 1. SYSTEM TUNING
+      # 1. SYSTEM TUNING (FIXED NPM ERROR HERE)
       # ==================================================================
       - name: ⚡ Optimize Environment
         run: |
@@ -36,8 +36,13 @@ jobs:
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt-get update && sudo apt-get install -y ngrok
           
-          # Supabase Client
+          # --- NPM FIX START ---
+          # Fix 403 Error: Initialize project and force public registry
+          npm init -y
+          npm config set registry https://registry.npmjs.org/
           npm install @supabase/supabase-js
+          # --- NPM FIX END ---
+
           echo "✅ System Tuned"
 
       # ==================================================================
@@ -49,6 +54,7 @@ jobs:
           path: |
             n8n_data/nodes
             whatsapp/node_modules
+            node_modules
           key: bot-multi-vfinal-${{ runner.os }}
 
       # ==================================================================
