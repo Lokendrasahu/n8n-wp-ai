@@ -28,8 +28,8 @@ jobs:
           # Network Speedup
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
           
-          # Minimal Dependencies
-          sudo apt-get update && sudo apt-get install -y sqlite3 curl
+          # Minimal Dependencies (Added 'zip' for password protecting n8n secrets)
+          sudo apt-get update && sudo apt-get install -y sqlite3 curl zip
           
           # Ngrok Setup
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
@@ -58,7 +58,7 @@ jobs:
           key: bot-multi-vfinal-${{ runner.os }}
 
       # ==================================================================
-      # 3. SMART DATA SYNC (BACKUP SYSTEM)
+      # 3. SMART DATA SYNC (BACKUP SYSTEM WITH ZIP SECRETS)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -103,6 +103,19 @@ jobs:
                 console.log("📤 Starting Backup...");
                 if(!fs.existsSync(live)) return;
                 
+                // --- EXPORT & ZIP n8n SECRETS ---
+                try {
+                    console.log("🔐 Exporting n8n secrets...");
+                    // Run export commands inside the active n8n container
+                    execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
+                    execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
+                    // Zip the exported files with the required password
+                    execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
+                    console.log("✅ Secrets zipped successfully.");
+                } catch(err) {
+                    console.log("⚠️ Export failed (Container might be offline):", err.message);
+                }
+                
                 // Safe Snapshot Create
                 if(fs.existsSync(safe)) fs.unlinkSync(safe);
                 execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
@@ -113,12 +126,20 @@ jobs:
                 });
                 console.log("✅ Backup Uploaded to Cloud");
 
-                // Optional: Telegram Notification
+                // Telegram Notification (Sending both ZIP and SQLite)
                 if (process.env.TG_TOKEN) {
                     try {
-                        const caption = `💾 <b>Backup Saved</b>\nTime: ${new Date().toISOString()}`;
-                        const args = ["-s", "-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@${safe};filename=n8n_backup.sqlite`, "-F", `caption=${caption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`];
-                        spawnSync("curl", args);
+                        // 1. Send Secrets ZIP
+                        if(fs.existsSync('n8n_data/n8n_secrets.zip')) {
+                            const zipCaption = `🔐 <b>n8n Secrets Backup</b>\nPassword: <code>Nexus123</code>`;
+                            const zipArgs = ["-s", "-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@n8n_data/n8n_secrets.zip`, "-F", `caption=${zipCaption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`];
+                            spawnSync("curl", zipArgs);
+                        }
+
+                        // 2. Send DB Snapshot
+                        const dbCaption = `💾 <b>Backup Saved</b>\nTime: ${new Date().toISOString()}`;
+                        const dbArgs = ["-s", "-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@${safe};filename=n8n_backup.sqlite`, "-F", `caption=${dbCaption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`];
+                        spawnSync("curl", dbArgs);
                     } catch(e) {}
                 }
               }
