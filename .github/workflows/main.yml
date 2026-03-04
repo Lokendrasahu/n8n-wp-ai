@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v3
 
       # ==================================================================
-      # 1. SYSTEM TUNING (FIXED NPM ERROR HERE)
+      # 1. SYSTEM TUNING (NGROK REMOVED)
       # ==================================================================
       - name: ⚡ Optimize Environment
         run: |
@@ -30,11 +30,6 @@ jobs:
           
           # Minimal Dependencies (Added 'zip' for password protecting n8n secrets)
           sudo apt-get update && sudo apt-get install -y sqlite3 curl zip
-          
-          # Ngrok Setup
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update && sudo apt-get install -y ngrok
           
           # --- NPM FIX START ---
           # Fix 403 Error: Initialize project and force public registry
@@ -153,26 +148,27 @@ jobs:
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # 4. LAUNCH SERVICES (MULTI-VENDOR)
+      # 4. LAUNCH SERVICES (CLOUDFLARE + MULTI-VENDOR)
       # ==================================================================
       - name: 🚀 Launch Bot Swarm
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NGROK_AUTH: ${{ secrets.NGROK_TOKEN }}
+          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           docker network create bot-net || true
           
-          # Start Ngrok
-          ngrok config add-authtoken $NGROK_AUTH
-          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > /dev/null &
+          # Start Cloudflare Tunnel (Host network to sync with Caddy)
+          docker run -d --name cloudflared --network host --restart unless-stopped \
+            cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
+          
           sleep 5
           
-          # Start n8n
+          # Start n8n (Updated Webhook URL to Custom Domain)
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
-            -e WEBHOOK_URL="https://${{ secrets.NGROK_DOMAIN }}" \
+            -e WEBHOOK_URL="https://nexusautomation.dpdns.org" \
             -e NODE_OPTIONS="--max-old-space-size=2048" \
             -e DB_SQLITE_VACUUM_ON_STARTUP=true \
             n8nio/n8n
@@ -300,7 +296,7 @@ jobs:
           # Start WhatsApp Container
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" node:20-alpine sh -c "apk add --no-cache git ffmpeg && npm install && node index.js"
           
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>Multi-Vendor System Online</b>" -d parse_mode="HTML"
+          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b>" -d parse_mode="HTML"
 
       # ==================================================================
       # 5. OBSERVER LOOP (✅ SAFE MANUAL CANCEL + AUTO BACKUP)
@@ -342,6 +338,7 @@ jobs:
               # 2. HEALTH CHECKS
               if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
+              if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
               # 3. PERIODIC BACKUP (Every 15 Minutes)
               # Logic: If mod 900 is less than 60, run backup (runs once per 15 min window)
