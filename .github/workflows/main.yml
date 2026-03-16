@@ -2,11 +2,18 @@ name: "Production vFinal (Multi-Vendor + Safe Cancel)"
 
 on:
   workflow_dispatch:
+  # FUTURE: Agar cron (schedule) lagana ho toh yahan add kar sakte hain
 
-# 🚫 CONSTRAINT: Parallel run allow nahi karna hai
-concurrency:
-  group: "production-bot"
-  cancel-in-progress: false
+# 🚫 CONSTRAINT REMOVED: Concurrency block hata diya gaya hai.
+# REASON: "Zero-Downtime" ke liye purana aur naya run 2-3 minute ke liye ek sath (overlap) chalne zaroori hain.
+# concurrency:
+#   group: "production-bot"
+#   cancel-in-progress: false
+
+# 🔑 PERMISSIONS REQUIRED: Naye bot ko purane bot ko cancel karne ka haq (write access) dena zaroori hai.
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   run-final-strict:
@@ -18,29 +25,21 @@ jobs:
         uses: actions/checkout@v3
 
       # ==================================================================
-      # 1. SYSTEM TUNING
+      # 1. PRE-FLIGHT (Setup environment in background, ZERO downtime here)
       # ==================================================================
-      - name: ⚡ Optimize Environment
+      - name: ⚡ Optimize Environment & Setup
         run: |
-          # Swap File (Critical for 7GB RAM limit)
+          # Memory Setup
           sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-          
-          # Network Speedup
+          # Network Setup
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          # Dependencies
+          sudo apt-get update && sudo apt-get install -y sqlite3 curl zip jq
           
-          # Minimal Dependencies
-          sudo apt-get update && sudo apt-get install -y sqlite3 curl zip
-          
-          # Fix 403 Error: Initialize project and force public registry
           npm init -y
           npm config set registry https://registry.npmjs.org/
           npm install @supabase/supabase-js
-          
-          echo "✅ System Tuned"
 
-      # ==================================================================
-      # 2. CACHING
-      # ==================================================================
       - name: 📦 Cache Modules
         uses: actions/cache@v3
         with:
@@ -51,7 +50,33 @@ jobs:
           key: bot-multi-vfinal-${{ runner.os }}
 
       # ==================================================================
-      # 3. SMART DATA SYNC (BACKUP SYSTEM WITH ZIP SECRETS)
+      # 2. THE HANDOVER (Active Kill Switch)
+      # ==================================================================
+      - name: 🤝 Execute Handover Protocol
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 Searching for older active runs..."
+          # Find any running workflow of this same type, EXCLUDING the current one
+          OLD_RUN=$(gh run list --workflow="Production vFinal (Multi-Vendor + Safe Cancel)" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
+          
+          if [ -n "$OLD_RUN" ]; then
+            echo "⚡ Found old run ID: $OLD_RUN. Sending Kill Signal..."
+            gh run cancel $OLD_RUN
+            
+            echo "⏳ Waiting for old run to gracefully save database and die..."
+            # Polling: Check every 2 seconds if the old run is fully shut down
+            while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
+              echo "   Still waiting..."
+              sleep 2
+            done
+            echo "✅ Old run successfully terminated. The stage is ours."
+          else
+            echo "🟢 No older runs found. Starting fresh."
+          fi
+
+      # ==================================================================
+      # 3. SMART DATA SYNC (Download Fresh DB immediately after old dies)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -63,7 +88,6 @@ jobs:
         run: |
           mkdir -p n8n_data/nodes whatsapp public
           
-          # --- Smart Sync Logic (Handles Backup & Restore) ---
           cat << 'EOF' > smart_sync.js
           const { createClient } = require('@supabase/supabase-js');
           const fs = require('fs'); const { execSync, spawnSync } = require('child_process');
@@ -81,63 +105,37 @@ jobs:
           }
 
           async function run(mode) {
-            try {
-              if(mode==='down') {
-                console.log("📥 Downloading Data...");
-                await retry(async () => {
-                   const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
-                   if(!error) {
-                     fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
-                     // Optimize SQLite for Performance
-                     try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
-                   }
-                });
-              } else {
-                console.log("📤 Starting Backup...");
-                if(!fs.existsSync(live)) return;
-                
-                // --- EXPORT & ZIP n8n SECRETS (WITH CLEANUP) ---
-                try {
-                    console.log("🔐 Exporting n8n secrets...");
-                    execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
-                    execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
-                    execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
-                    
-                    // NEW: Delete unencrypted files immediately after zipping for security
-                    execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
-                    console.log("✅ Secrets zipped & raw files deleted.");
-                } catch(err) {
-                    console.log("⚠️ Export failed:", err.message);
-                }
-                
-                // NEW: VACUUM Database before taking a snapshot to keep file size minimum
-                try { execSync("sqlite3 " + live + " 'VACUUM;'"); console.log("🧹 Database Vacuumed."); } catch(e) {}
+            if(mode==='down') {
+              console.log("📥 Downloading Data...");
+              await retry(async () => {
+                 const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
+                 if(!error) {
+                   fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
+                   try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
+                 }
+              });
+            } else {
+              console.log("📤 Starting Backup...");
+              if(!fs.existsSync(live)) return;
+              
+              // [CONSTRAINT]: Security - Delete unencrypted keys immediately after zip
+              try {
+                  execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
+                  execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
+                  execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
+                  execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
+              } catch(err) {}
+              
+              // [CONSTRAINT]: Storage - Vacuum DB to keep file size small for fast uploads
+              try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
 
-                // Safe Snapshot Create
-                if(fs.existsSync(safe)) fs.unlinkSync(safe);
-                execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
-                
-                // Upload to Supabase
-                await retry(async () => {
-                   await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
-                });
-                console.log("✅ Backup Uploaded to Cloud");
-
-                // Telegram Notification
-                if (process.env.TG_TOKEN) {
-                    try {
-                        if(fs.existsSync('n8n_data/n8n_secrets.zip')) {
-                            const zipCaption = `🔐 <b>n8n Secrets Backup</b>\nPassword: <code>Nexus123</code>`;
-                            const zipArgs = ["-s", "-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@n8n_data/n8n_secrets.zip`, "-F", `caption=${zipCaption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`];
-                            spawnSync("curl", zipArgs);
-                        }
-                        const dbCaption = `💾 <b>Backup Saved (Max 100 Execs)</b>\nTime: ${new Date().toISOString()}`;
-                        const dbArgs = ["-s", "-F", `chat_id=${process.env.TG_ID}`, "-F", `document=@${safe};filename=n8n_backup.sqlite`, "-F", `caption=${dbCaption}`, "-F", "parse_mode=HTML", `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument`];
-                        spawnSync("curl", dbArgs);
-                    } catch(e) {}
-                }
-              }
-            } catch(e) { console.error("Sync Error:", e.message); }
+              if(fs.existsSync(safe)) fs.unlinkSync(safe);
+              execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
+              
+              await retry(async () => {
+                 await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
+              });
+            }
           }
           run(process.argv[2]);
           EOF
@@ -159,9 +157,7 @@ jobs:
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
           
-          sleep 5
-          
-          # --- FIXED N8N CONFIGURATION (ADDED MAX 100 EXECUTIONS PRUNING) ---
+          # [CONSTRAINT]: n8n limits. EXECUTIONS_DATA_PRUNE_MAX_COUNT ensures max 100 runs.
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
@@ -174,16 +170,14 @@ jobs:
             -e EXECUTIONS_DATA_MAX_AGE=48 \
             -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=100 \
             n8nio/n8n
-          # ----------------------------------------------------------------------
 
-          # Prepare WhatsApp Package (NEW: Added node-cache for memory management)
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          # --- MULTI-VENDOR CODE ---
+          # [REASON]: Baileys implementation kept exact as your previous version with NodeCache fix.
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
           const express = require('express'); const axios = require('axios'); const mongoose = require('mongoose'); const QRCode = require('qrcode'); const pino = require('pino');
-          const NodeCache = require('node-cache'); // NEW: For memory leak fix
+          const NodeCache = require('node-cache');
           const app = express(); app.use(express.json());
           const PORT = 10000;
           const N8N_URL = "http://n8n:5678/webhook/whatsapp"; 
@@ -229,25 +223,18 @@ jobs:
           }
 
           async function start(v) {
-              console.log(`Starting ${v}...`);
               const { state, saveCreds } = await useAuth(v);
               const { version } = await fetchLatestBaileysVersion();
-              const msgRetryCounterCache = new NodeCache(); // NEW: Clears buffer cache periodically
+              const msgRetryCounterCache = new NodeCache();
               
-              const sock = makeWASocket({ 
-                  version, 
-                  auth: state, 
-                  logger: pino({ level: 'silent' }), 
-                  browser: ["Ubuntu", "Chrome", "20.0"],
-                  msgRetryCounterCache // Prevent memory leak from metadata buildup
-              });
+              const sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }), browser: ["Ubuntu", "Chrome", "20.0"], msgRetryCounterCache });
               
               sessions[v] = sock;
               sock.ev.on('creds.update', saveCreds);
               
               sock.ev.on('connection.update', (u) => { 
                   if(u.qr) qrs[v] = u.qr; 
-                  if(u.connection === 'open') { qrs[v] = null; console.log(`${v} Online`); }
+                  if(u.connection === 'open') { qrs[v] = null; }
                   if(u.connection === 'close' && u.lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) setTimeout(() => start(v), 5000);
               });
               
@@ -269,7 +256,6 @@ jobs:
           app.get('/reset', async (req, res) => {
               const v = req.query.v; 
               if(!v) return res.send("Specify vendor: ?v=v1 or ?v=v2");
-              console.log(`Resetting ${v}`);
               await AuthModel.deleteMany({ _id: { $regex: `^${v}-` } });
               if(sessions[v]) sessions[v].logout();
               res.send(`<h1>♻️ ${v} Reset.</h1><script>setTimeout(()=>location.href='/qr?v=${v}', 3000)</script>`);
@@ -286,48 +272,52 @@ jobs:
           });
 
           app.get('/health', (req, res) => res.send("OK"));
-          
           app.listen(PORT, () => { start('v1'); start('v2'); });
           EOF
 
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
-          
           docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
-          
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" node:20-alpine sh -c "apk add --no-cache git ffmpeg && npm install && node index.js"
           
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b>" -d parse_mode="HTML"
+          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Handover Complete)" -d parse_mode="HTML"
 
       # ==================================================================
-      # 5. OBSERVER LOOP
+      # 5. OBSERVER LOOP (With strict graceful shutdown trap)
       # ==================================================================
       - name: 🔄 Observer Loop
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cleanup() {
-              echo "🛑 STOP SIGNAL RECEIVED"
-              echo "💾 Initiating Emergency Backup..."
+              echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
+              
+              # [CONSTRAINT]: Split-Brain & Flapping Prevention
+              # REASON: Must immediately kill network-facing containers before backing up DB
+              echo "🔪 Instantly severing connections (wa-bot & cloudflared)..."
+              docker stop cloudflared wa-bot || true
+              
+              echo "💾 Initiating Final Emergency Backup..."
               node smart_sync.js up
-              echo "✅ Backup Done. Exiting safely."
+              echo "✅ Backup Uploaded. Yielding to new workflow."
               exit 0
           }
           
+          # TRAP: This catches the 'gh run cancel' command sent by the new workflow
           trap 'cleanup' SIGINT SIGTERM EXIT
           
           START=$(date +%s)
-          echo "🔄 Loop Started. Monitoring..."
+          echo "🔄 Observer Active. Ready to hand over when signaled."
           
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              if [ $DIFF -ge 21000 ]; then
-                  echo "⏰ Time limit reached. Handover..."
-                  gh workflow run main.yml || echo "⚠️ GH Handover Failed"
+              # Trigger handover every 5 hours (18000s) to be safe before 6h timeout
+              if [ $DIFF -ge 18000 ]; then
+                  echo "⏰ Time limit approaching. Triggering Handover..."
+                  gh workflow run main.yml
+                  sleep 300 # Wait up to 5 mins for new bot to send the kill signal
                   exit 0
               fi
               
@@ -336,18 +326,7 @@ jobs:
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
-                  echo "⏰ Periodic 15-min Backup..."
                   node smart_sync.js up
               fi
-              
-              echo "💓 Alive: ${DIFF}s"
               sleep 60
           done
-
-      - name: 🚨 Notify Failure
-        if: failure()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="⚠️ <b>CRITICAL FAILURE</b>\nBot crashed." -d parse_mode="HTML"
