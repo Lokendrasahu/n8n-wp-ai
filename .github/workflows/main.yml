@@ -4,13 +4,8 @@ on:
   workflow_dispatch:
   # FUTURE: Agar cron (schedule) lagana ho toh yahan add kar sakte hain
 
-# 🚫 CONSTRAINT REMOVED: Concurrency block hata diya gaya hai.
-# REASON: "Zero-Downtime" ke liye purana aur naya run 2-3 minute ke liye ek sath (overlap) chalne zaroori hain.
-# concurrency:
-#   group: "production-bot"
-#   cancel-in-progress: false
-
-# 🔑 PERMISSIONS REQUIRED: Naye bot ko purane bot ko cancel karne ka haq (write access) dena zaroori hai.
+# 🚫 CONSTRAINT REMOVED: Concurrency block hata diya gaya hai taaki naya aur purana bot overlap kar sakein (For Zero-Downtime Handover).
+# permissions: Naye bot ko purane bot ko cancel karne ka haq (write access) dena zaroori hai.
 permissions:
   actions: write
   contents: read
@@ -18,7 +13,7 @@ permissions:
 jobs:
   run-final-strict:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360 # GitHub max limit: 6 Hours
     
     steps:
       - name: Checkout Code
@@ -157,7 +152,9 @@ jobs:
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
           
-          # [CONSTRAINT]: n8n limits. EXECUTIONS_DATA_PRUNE_MAX_COUNT ensures max 100 runs.
+          # [CONSTRAINT]: n8n Super-Lightweight Setup. 
+          # - EXECUTIONS_DATA sets max 100 runs.
+          # - N8N_WORKFLOW_HISTORY/DIAGNOSTICS = false stops background bloat.
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
@@ -169,11 +166,14 @@ jobs:
             -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=48 \
             -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=100 \
+            -e N8N_WORKFLOW_HISTORY_ENABLED=false \
+            -e N8N_DIAGNOSTICS_ENABLED=false \
+            -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n
 
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          # [REASON]: Baileys implementation kept exact as your previous version with NodeCache fix.
+          # [REASON]: Baileys implementation with NodeCache for Memory Leak Fix.
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
           const express = require('express'); const axios = require('axios'); const mongoose = require('mongoose'); const QRCode = require('qrcode'); const pino = require('pino');
@@ -313,11 +313,16 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # Trigger handover every 5 hours (18000s) to be safe before 6h timeout
-              if [ $DIFF -ge 18000 ]; then
-                  echo "⏰ Time limit approaching. Triggering Handover..."
+              # [CONSTRAINT]: 5h 50m (21000s) Handover Timer. Leaves 10 mins buffer before GH 6h hard-kill.
+              if [ $DIFF -ge 21000 ]; then
+                  echo "⏰ Time limit (5h 50m) approaching. Triggering Handover..."
+                  # IMPORTANT: Ensure your workflow file is exactly named 'main.yml' in the repo
                   gh workflow run main.yml
-                  sleep 300 # Wait up to 5 mins for new bot to send the kill signal
+                  
+                  # Buffer: Wait up to 5 mins for new bot to boot and send the kill signal to THIS run
+                  sleep 300 
+                  
+                  # If new bot fails to kill this run after 5 mins, exit gracefully (triggers trap backup)
                   exit 0
               fi
               
@@ -325,6 +330,7 @@ jobs:
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
+              # Periodic Backup every 15 mins
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   node smart_sync.js up
               fi
