@@ -1,4 +1,4 @@
-name: "Nexus Core: Multi-Vendor AI (Zero-Downtime Hardened)"
+name: "Nexus Core"
 
 on:
   workflow_dispatch:
@@ -16,17 +16,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ============================================================
-      # 1) BASE SETUP
-      # - Safe runner optimization
-      # - Required packages
-      # - Node dependency for smart_sync.js
-      # ============================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
           set -euo pipefail
 
-          # Safe swap setup: create only if not already active
           if ! swapon --show | grep -q '/swapfile'; then
             sudo fallocate -l 4G /swapfile || true
             sudo chmod 600 /swapfile || true
@@ -44,10 +37,6 @@ jobs:
           npm config set registry https://registry.npmjs.org/
           npm install @supabase/supabase-js
 
-      # ============================================================
-      # 2) CACHE RESTORE
-      # - Must run BEFORE heavy pulls/builds
-      # ============================================================
       - name: 📦 Cache Modules
         uses: actions/cache@v4
         with:
@@ -55,17 +44,12 @@ jobs:
             n8n_data/node_modules
             whatsapp/node_modules
             node_modules
-          key: nexus-core-cache-${{ runner.os }}-v8
+          key: nexus-core-cache-${{ runner.os }}-v9
 
-      # ============================================================
-      # 3) PRE-WARM DEPENDENCIES
-      # - Old bot remains live during this phase
-      # ============================================================
       - name: 🐋 Pre-Fetch Docker Images & Dependencies
         run: |
           set -euo pipefail
 
-          echo "📥 Pre-warming images while old bot is still LIVE..."
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
           docker pull caddy:latest
@@ -88,20 +72,12 @@ jobs:
           }
           EOF
 
-          # Build WhatsApp bot dependencies
           docker run --rm -v "$(pwd)/whatsapp:/app" -w /app node:20-alpine \
             sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
-          # Install libsodium inside the mounted n8n volume
           docker run --rm -v "$(pwd)/n8n_data:/n8n_data" -w /n8n_data node:20-alpine \
             sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
-      # ============================================================
-      # 4) HANDOVER REQUEST
-      # - Detect older active-like runs
-      # - Cancel them safely
-      # - Abort if old run does not exit in time
-      # ============================================================
       - name: 🤝 Execute Handover Protocol
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -122,19 +98,15 @@ jobs:
           ')
 
           if [ -z "$OLD_RUN" ]; then
-            echo "🟢 No older active-like run found. Starting clean."
+            echo "No older active-like run found."
             exit 0
           fi
 
-          echo "⚡ Found old run: $OLD_RUN"
           gh run cancel "$OLD_RUN" || true
 
-          echo "⏳ Waiting up to 5 minutes for old run to finish handover..."
           ACTIVE=1
           for i in $(seq 1 60); do
             STATUS=$(gh run view "$OLD_RUN" --json status -q '.status' 2>/dev/null || echo "done")
-            echo "Old run status: $STATUS"
-
             case "$STATUS" in
               queued|requested|waiting|in_progress)
                 sleep 5
@@ -147,18 +119,10 @@ jobs:
           done
 
           if [ "$ACTIVE" -eq 1 ]; then
-            echo "❌ Old run is still active after timeout. Aborting to avoid split-brain."
+            echo "Old run still active. Aborting."
             exit 1
           fi
 
-          echo "✅ Old run fully stopped. Safe to continue."
-
-      # ============================================================
-      # 5) DATA LAYER
-      # - Versioned SQLite snapshots
-      # - latest.json pointer
-      # - No VACUUM / No Telegram in fast handover path
-      # ============================================================
       - name: 💾 Setup Data Layer
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
@@ -226,10 +190,7 @@ jobs:
             ensureParent(live);
 
             const pointer = await retry(() => downloadPointer()).catch(() => null);
-            if (!pointer || !pointer.path) {
-              console.log('No pointer found, continuing fresh.');
-              return;
-            }
+            if (!pointer || !pointer.path) return;
 
             const { data, error } = await retry(() => sb.storage.from(bucket).download(pointer.path));
             if (error) throw error;
@@ -246,13 +207,11 @@ jobs:
 
             if (fs.existsSync(safe)) fs.unlinkSync(safe);
 
-            // Use SQLite online backup to create a safe copy
             execSync(`sqlite3 "${live}" ".backup '${safe}'"`);
 
             const stamp = buildStamp();
             const snapPath = `snapshots/db_${stamp}.sqlite`;
 
-            // Step 1: upload versioned DB snapshot
             await retry(async () => {
               const { error } = await sb.storage.from(bucket).upload(
                 snapPath,
@@ -265,7 +224,6 @@ jobs:
               if (error) throw error;
             });
 
-            // Step 2: update tiny pointer only after snapshot upload success
             const pointer = {
               path: snapPath,
               generated_at: new Date().toISOString()
@@ -336,12 +294,6 @@ jobs:
           node smart_sync.js down || true
           sudo chmod -R 755 n8n_data whatsapp
 
-      # ============================================================
-      # 6) LAUNCH STACK
-      # - Start apps first
-      # - Wait for local health
-      # - Start cloudflared LAST
-      # ============================================================
       - name: 🚀 Launch Bot Swarm
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -354,7 +306,6 @@ jobs:
           docker network create bot-net || true
           docker rm -f cloudflared n8n caddy wa-bot >/dev/null 2>&1 || true
 
-          # Start n8n first
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v "$(pwd)/n8n_data:/home/node/.n8n" \
             -e N8N_HOST="0.0.0.0" \
@@ -374,8 +325,7 @@ jobs:
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n:latest
 
-          # Write WhatsApp bridge app
-          cat << 'EOF' > whatsapp/index.js
+          cat > whatsapp/index.js << 'EOF'
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion, initAuthCreds } = require('@whiskeysockets/baileys');
           const express = require('express');
           const axios = require('axios');
@@ -541,20 +491,18 @@ jobs:
           });
           EOF
 
-          # Start wa-bot
           docker run -d --name wa-bot --network bot-net --restart unless-stopped \
             -v "$(pwd)/whatsapp:/app" -w /app \
             -e MONGODB_URI="$MONGODB_URI" \
             -e TZ="Asia/Kolkata" \
             node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
 
-          # Start Caddy
-          cat << 'EOF' > Caddyfile
+          cat > Caddyfile << 'EOF'
           :80 {
             reverse_proxy /qr* wa-bot:10000
             reverse_proxy /reset* wa-bot:10000
             reverse_proxy /health wa-bot:10000
-            reverse_proxy /* n8n:5678
+            reverse_proxy * n8n:5678
           }
           EOF
 
@@ -563,8 +511,7 @@ jobs:
             -v "$(pwd)/Caddyfile:/etc/caddy/Caddyfile" \
             caddy:latest
 
-          # Wait for local health BEFORE exposing tunnel
-          echo "⏳ Waiting for local origin to become healthy..."
+          echo "Waiting for local origin..."
           for i in $(seq 1 60); do
             ROOT_OK=0
             WA_OK=0
@@ -573,12 +520,10 @@ jobs:
             curl -fsS http://127.0.0.1/health >/dev/null 2>&1 && WA_OK=1 || true
 
             if [ "$ROOT_OK" -eq 1 ] && [ "$WA_OK" -eq 1 ]; then
-              echo "✅ Origin is healthy."
               break
             fi
 
             if [ "$i" -eq 60 ]; then
-              echo "❌ Origin did not become healthy in time."
               docker logs n8n --tail 100 || true
               docker logs wa-bot --tail 100 || true
               docker logs caddy --tail 100 || true
@@ -588,22 +533,16 @@ jobs:
             sleep 5
           done
 
-          # Start cloudflared LAST
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token "$CF_TOKEN"
 
-          # Optional startup notification
+          docker logs cloudflared --tail 50 || true
+
           curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
             -d chat_id="$TG_ID" \
             -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Handover Complete)" \
             -d parse_mode="HTML" >/dev/null || true
 
-      # ============================================================
-      # 7) OBSERVER LOOP
-      # - Handles kill signals from next run
-      # - Stops n8n FIRST
-      # - Uses short polling instead of sleep 300
-      # ============================================================
       - name: 🔄 Observer Loop
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -621,21 +560,9 @@ jobs:
             fi
 
             touch /tmp/backup_done
-            echo "🛑 Kill signal received. Starting safe handover..."
-
-            # Stop n8n first so SQLite writes stop immediately
-            echo "🧊 Step 1: Stop n8n first"
             docker kill n8n >/dev/null 2>&1 || true
-
-            # Then stop traffic-facing containers
-            echo "📵 Step 2: Stop wa-bot, caddy, and cloudflared"
             docker kill wa-bot caddy cloudflared >/dev/null 2>&1 || true
-
-            # Fast handover path: versioned DB snapshot + pointer only
-            echo "💾 Step 3: Upload versioned snapshot"
             timeout 8s node smart_sync.js up_fast || true
-
-            echo "✅ Handover cleanup complete."
             exit 0
           }
 
@@ -646,34 +573,26 @@ jobs:
           HANDOVER_SENT=0
           HANDOVER_TS=0
 
-          echo "🔄 Observer Active. Serving clients..."
-
           while true; do
             NOW=$(date +%s)
             DIFF=$((NOW - START))
 
-            # Trigger next workflow before GitHub hard timeout
             if [ $DIFF -ge 21000 ] && [ $HANDOVER_SENT -eq 0 ]; then
-              echo "⏰ Time limit approaching. Triggering next workflow..."
               gh workflow run "${{ github.workflow }}" || true
               HANDOVER_SENT=1
               HANDOVER_TS=$NOW
             fi
 
-            # If next run doesn't take over, keep serving and avoid split-brain
             if [ $HANDOVER_SENT -eq 1 ] && [ $((NOW - HANDOVER_TS)) -ge 300 ]; then
-              echo "⚠️ New workflow did not take over within 5 minutes. Resetting trigger and continuing."
               HANDOVER_SENT=0
               HANDOVER_TS=0
             fi
 
-            # Self-healing
             docker ps --format '{{.Names}}' | grep -qx wa-bot || docker restart wa-bot >/dev/null 2>&1 || true
             docker ps --format '{{.Names}}' | grep -qx n8n || docker restart n8n >/dev/null 2>&1 || true
             docker ps --format '{{.Names}}' | grep -qx caddy || docker restart caddy >/dev/null 2>&1 || true
             docker ps --format '{{.Names}}' | grep -qx cloudflared || docker restart cloudflared >/dev/null 2>&1 || true
 
-            # Heavy backup every ~15 minutes only
             SLOT=$((DIFF / 900))
             if [ $((DIFF % 900)) -lt 10 ] && [ "$LAST_FULL_BACKUP_SLOT" != "$SLOT" ]; then
               LAST_FULL_BACKUP_SLOT="$SLOT"
@@ -682,4 +601,3 @@ jobs:
 
             sleep 10
           done
-
