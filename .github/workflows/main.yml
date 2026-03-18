@@ -43,7 +43,7 @@ jobs:
           # Compile WhatsApp Dependencies
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
-          # [LIBSODIUM FIX]: Pre-install directly inside the n8n_data persistent volume
+          # Pre-install Libsodium directly inside the n8n_data persistent volume
           docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
       - name: 📦 Cache Modules
@@ -70,7 +70,7 @@ jobs:
               echo "⏳ Found active older bot ($OLD_RUN). Waiting patiently for it to gracefully save data and exit..."
               while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
                 echo "   ...Old bot is finalizing backup..."
-                sleep 5
+                sleep 10
               done
               echo "✅ Older bot ($OLD_RUN) safely terminated."
             done
@@ -116,7 +116,6 @@ jobs:
                  }
               });
             } else if (mode === 'live_backup') {
-              // [USER LOGIC]: Heavy backup happens HERE while bot is STILL ALIVE
               console.log("📤 [PHASE 1] Starting LIVE Heavy Backup (No Downtime)...");
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
@@ -129,7 +128,6 @@ jobs:
               } catch(err) { console.log("Live export skipped/failed"); }
               
             } else if (mode === 'final_db_sync') {
-              // [USER LOGIC]: Final DB sync happens after connections are cut
               console.log("📤 [PHASE 3] Starting FINAL DB SYNC (Bot is now offline)...");
               if(!fs.existsSync(live)) return;
               
@@ -142,6 +140,15 @@ jobs:
                   execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
               } catch(err) { console.log("DB SQLite copy failed"); }
 
+              await retry(async () => {
+                 await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
+              });
+            } else if (mode === 'periodic') {
+              // Silent DB upload every 15 mins for safety
+              if(!fs.existsSync(live)) return;
+              try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
+              if(fs.existsSync(safe)) fs.unlinkSync(safe);
+              try { execSync("sqlite3 " + live + " \".backup '" + safe + "'\""); } catch(e) {}
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
@@ -318,44 +325,44 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # Condition 1: Normal Auto-Handover (5 hours 50 mins)
               if [ $DIFF -ge 21000 ]; then
                   echo "⏰ Time limit (5h 50m) reached. Triggering a fresh bot..."
                   gh workflow run main.yml
-                  sleep 60 # Give the new bot time to wake up and fetch images
+                  sleep 60 
+                  break 
+              fi
+              
+              # [CONSTRAINT FIX]: Removed the status filter. It now detects ANY newer run instantly!
+              LATEST_RUN=$(gh run list --workflow="main.yml" --limit 1 --json databaseId -q ".[0].databaseId")
+              if [ -n "$LATEST_RUN" ] && [ "$LATEST_RUN" != "${{ github.run_id }}" ]; then
+                  echo "🚨 NEW WORKFLOW DETECTED (ID: $LATEST_RUN)!"
+                  echo "🔄 Yielding the stage. Starting Graceful Shutdown..."
                   break # Exit loop to run Graceful Shutdown
               fi
               
-              # Condition 2: Did someone MANUALLY start a new workflow from GitHub?
-              NEWER_RUNS=$(gh run list --workflow="main.yml" --status=in_progress --json databaseId -q "[.[] | select(.databaseId > ${{ github.run_id }})] | length")
-              if [ "$NEWER_RUNS" -gt 0 ]; then
-                  echo "🔄 Newer manual run detected! Preparing to yield the stage..."
-                  break # Exit loop to run Graceful Shutdown
+              # Suppress output of container restart checks to keep logs clean
+              if ! docker ps | grep -q wa-bot; then docker restart wa-bot > /dev/null; fi
+              if ! docker ps | grep -q n8n; then docker restart n8n > /dev/null; fi
+              if ! docker ps | grep -q cloudflared; then docker restart cloudflared > /dev/null; fi
+              
+              # Silent Periodic DB Sync
+              if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
+                  node smart_sync.js periodic >/dev/null 2>&1 || true
               fi
-              
-              if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
-              if ! docker ps | grep -q n8n; then docker restart n8n; fi
-              if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
-              
               sleep 30
           done
           
           # =========================================================
-          # 🛑 THE GRACEFUL SHUTDOWN SEQUENCE (User Logic Applied)
+          # 🛑 THE GRACEFUL SHUTDOWN SEQUENCE
           # =========================================================
-          
-          # PHASE 1: Heavy Backup WHILE BOT IS STILL ONLINE (Zero Data Loss, Zero Downtime)
           echo "💾 [PHASE 1] Backing up heavy n8n JSON files while system is still LIVE..."
           node smart_sync.js live_backup
           
-          # PHASE 2: Kill Network Connections (Prevents Session Collision & locks the DB)
           echo "🔪 [PHASE 2] Instantly severing network traffic (wa-bot, n8n, cloudflared)..."
           docker kill cloudflared wa-bot n8n || true
           
-          # PHASE 3: Fast SQLite Backup (Bot is now safely offline)
           echo "💾 [PHASE 3] Uploading exact, locked SQLite state..."
           node smart_sync.js final_db_sync
           
-          # PHASE 4: Final Exit (This signals the waiting New Bot to take over instantly)
           echo "✅ Handover Data Saved & Connections Cut. Exiting so the New Bot can take over!"
           exit 0
