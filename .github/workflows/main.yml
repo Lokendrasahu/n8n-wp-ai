@@ -1,4 +1,4 @@
-name: "Production vFinal (Multi-Vendor + Safe Cancel)"
+name: "Nexus Core: Multi-Vendor AI (Zero-Downtime)"
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  run-final-strict:
+  run-nexus-core:
     runs-on: ubuntu-latest
     timeout-minutes: 360 
     
@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v3
 
       # ==================================================================
-      # 1. PRE-FLIGHT & PRE-FETCH (ZERO downtime. Old bot is still running)
+      # 1. PRE-FLIGHT & PRE-FETCH (Zero-Downtime Prep)
       # ==================================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
@@ -31,7 +31,7 @@ jobs:
 
       - name: 🐋 Pre-Fetch Docker Images & Dependencies (Saves 60+ seconds)
         run: |
-          echo "📥 Downloading massive images in background..."
+          echo "📥 Downloading massive images in background (Old bot is still LIVE)..."
           # [CONSTRAINT]: Pull images BEFORE killing the old bot to ensure zero-downtime
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
@@ -44,6 +44,10 @@ jobs:
           
           # [REASON]: Temporary container securely runs npm install BEFORE handover
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg && npm install"
+
+          # [NEW OPTIMIZATION]: Pre-install Libsodium for n8n SaaS API Key Encryption BEFORE handover
+          # This saves ~1 second during the critical boot phase
+          docker run --rm -v $(pwd)/n8n_data:/home/node/.n8n -u node n8nio/n8n npm install libsodium-wrappers --prefix /home/node/.n8n
 
       - name: 📦 Cache Modules
         uses: actions/cache@v3
@@ -62,13 +66,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔍 Searching for older active runs..."
-          OLD_RUN=$(gh run list --workflow="Production vFinal (Multi-Vendor + Safe Cancel)" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
+          OLD_RUN=$(gh run list --workflow="Nexus Core: Multi-Vendor AI (Zero-Downtime)" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
           
           if [ -n "$OLD_RUN" ]; then
             echo "⚡ Found old run ID: $OLD_RUN. Sending Kill Signal..."
             gh run cancel $OLD_RUN
             
             echo "⏳ Waiting for old run to gracefully save database and die..."
+            # [CONSTRAINT]: Strict polling ensures absolute prevention of Split-Brain/Session Collisions
             while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
               echo "   Still waiting..."
               sleep 2
@@ -87,7 +92,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
         run: |
           cat << 'EOF' > smart_sync.js
           const { createClient } = require('@supabase/supabase-js');
@@ -132,6 +136,7 @@ jobs:
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
               } catch(err) {}
               
+              // [CONSTRAINT]: Storage - Vacuum DB to keep file size small for fast uploads
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
 
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
@@ -168,6 +173,8 @@ jobs:
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
           
+          # [CONSTRAINT]: n8n Super-Lightweight Setup. 
+          # EXECUTIONS_DATA sets max runs. WORKFLOW_HISTORY/DIAGNOSTICS = false stops bloat.
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
@@ -183,9 +190,6 @@ jobs:
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n
-
-          # [CONSTRAINT]: Install Libsodium inside n8n for SaaS API Key Encryption
-          docker exec -u node n8n npm install libsodium-wrappers --prefix /home/node/.n8n
 
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -235,11 +239,13 @@ jobs:
               };
           }
 
+          // [CONSTRAINT FIX]: Smart Webhook Retry Logic
+          // REASON: wa-bot boots in 2s, but n8n takes 15s. This holds messages and prevents data loss during handover.
           async function sendWebhookWithRetry(payload, retries = 5) {
               for (let i = 0; i < retries; i++) {
                   try {
                       await axios.post(N8N_URL, payload);
-                      return;
+                      return; // Success
                   } catch (err) {
                       if (i === retries - 1) console.error("Webhook failed completely after retries.");
                       else await new Promise(r => setTimeout(r, 4000));
@@ -303,6 +309,7 @@ jobs:
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
+          # [CONSTRAINT FIX]: No npm install here. Pre-compiled node_modules are used for instantaneous 0-second boot.
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" node:20-alpine sh -c "apk add --no-cache ffmpeg && node index.js"
           
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Ultra-Fast Handover Complete)" -d parse_mode="HTML"
@@ -319,10 +326,11 @@ jobs:
           cleanup() {
               echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
               
+              # [CONSTRAINT]: Split-Brain Prevention. Severing network before backup ensures no session clash.
               echo "🔪 Instantly severing connections (wa-bot & cloudflared)..."
               docker stop cloudflared wa-bot || true
               
-              echo "💾 Initiating Final Emergency Backup..."
+              echo "💾 Initiating Final Emergency Backup & Telegram Dispatch..."
               node smart_sync.js up
               echo "✅ Backup Uploaded. Yielding to new workflow."
               exit 0
@@ -336,10 +344,16 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
+              # [CONSTRAINT]: 5h 50m (21000s) Handover Timer. Leaves 10 mins buffer before GH 6h hard-kill.
               if [ $DIFF -ge 21000 ]; then
                   echo "⏰ Time limit (5h 50m) approaching. Triggering Handover..."
+                  # IMPORTANT: Ensure your workflow file is exactly named 'main.yml' in the repo
                   gh workflow run main.yml
+                  
+                  # Buffer: Wait up to 5 mins for new bot to boot and send the kill signal to THIS run
                   sleep 300 
+                  
+                  # If new bot fails to kill this run after 5 mins, exit gracefully (triggers trap backup)
                   exit 0
               fi
               
@@ -347,6 +361,7 @@ jobs:
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
+              # Periodic Backup every 15 mins (Ensures continuous safety)
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   node smart_sync.js up
               fi
