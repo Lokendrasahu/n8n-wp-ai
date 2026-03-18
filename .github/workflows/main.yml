@@ -41,19 +41,13 @@ jobs:
           mkdir -p whatsapp public n8n_data/nodes
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          # [CONSTRAINT FIX & ALPINE FIX]: Injecting Build-Base & libc6-compat for flawless native module compilation
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
-
-          echo "🔐 Compiling Libsodium for n8n Crypto Engine..."
-          # [ALPINE FIX]: Adding Python & Build tools for native bindings. Using node:20-alpine avoids n8n image EACCES errors.
-          docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ && npm install libsodium-wrappers"
 
       - name: 📦 Cache Modules
         uses: actions/cache@v3
         with:
           path: |
             n8n_data/nodes
-            n8n_data/node_modules
             whatsapp/node_modules
             node_modules
           key: bot-multi-vfinal-${{ runner.os }}
@@ -83,7 +77,7 @@ jobs:
           fi
 
       # ==================================================================
-      # 3. SMART DATA SYNC (With Telegram Backups)
+      # 3. SMART DATA SYNC (With Fast Telegram Backups)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -119,30 +113,34 @@ jobs:
                  }
               });
             } else {
-              console.log("📤 Starting Backup...");
+              console.log("📤 Starting Backup & Telegram Dispatch...");
               if(!fs.existsSync(live)) return;
               
+              // 1. FAST EXPORT & ZIP
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
                   execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
                   
+                  // 2. SEND ZIP TO TELEGRAM
                   const tgMsg1 = "📎 n8n_secrets.zip n8n Secrets Backup\nPassword: Nexus123";
                   execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
 
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
               } catch(err) {}
               
+              // 3. FAST DB VACUUM & COPY
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
-
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
               execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
               
+              // 4. SEND DB TO TELEGRAM
               try {
                   const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Max 100 Execs)\nTime: ${new Date().toISOString()}`;
                   execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
               } catch(err) {}
 
+              // 5. SUPABASE CLOUD SYNC
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
@@ -153,7 +151,6 @@ jobs:
           
           node smart_sync.js down
           
-          # Sets correct permissions for node_modules installed via docker root
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
@@ -170,7 +167,6 @@ jobs:
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
           
-          # [CONSTRAINT]: Added NODE_PATH so n8n can find locally installed libsodium wrappers
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
@@ -179,7 +175,6 @@ jobs:
             -e DB_SQLITE_VACUUM_ON_STARTUP=true \
             -e NODE_FUNCTION_ALLOW_BUILTIN=* \
             -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
-            -e NODE_PATH="/home/node/.n8n/node_modules" \
             -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=48 \
             -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=100 \
@@ -187,6 +182,8 @@ jobs:
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n
+
+          docker exec -u root n8n npm install -g libsodium-wrappers
 
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -304,7 +301,6 @@ jobs:
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          # [CONSTRAINT FIX]: Added tzdata for accurate WhatsApp timestamps
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
           
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Ultra-Fast Handover Complete)" -d parse_mode="HTML"
@@ -321,8 +317,10 @@ jobs:
           cleanup() {
               echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
               
+              # [CONSTRAINT FIX]: Use 'kill' instead of 'stop'. 
+              # 'stop' waits 10s and consumes the entire GH Actions cancellation grace period, killing the backup script.
               echo "🔪 Instantly severing connections (wa-bot & cloudflared)..."
-              docker stop cloudflared wa-bot || true
+              docker kill cloudflared wa-bot || true
               
               echo "💾 Initiating Final Emergency Backup & Telegram Dispatch..."
               node smart_sync.js up
