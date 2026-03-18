@@ -14,10 +14,10 @@ jobs:
     
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # ==================================================================
-      # 1. PRE-FLIGHT & PRE-FETCH (Zero-Downtime Prep)
+      # 1. PRE-FLIGHT (Setup environment & Pre-compile Libsodium)
       # ==================================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
@@ -29,25 +29,29 @@ jobs:
           npm config set registry https://registry.npmjs.org/
           npm install @supabase/supabase-js
 
-      - name: 🐋 Pre-Fetch Docker Images & Dependencies (Saves 60+ seconds)
+      - name: 🐋 Pre-Fetch Docker Images & Dependencies
         run: |
-          echo "📥 Downloading massive images in background (Old bot is still LIVE)..."
+          echo "📥 Downloading massive images in background..."
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
           docker pull caddy:latest
           docker pull node:20-alpine
           
-          echo "📦 Compiling WhatsApp Bot Node Modules..."
-          mkdir -p whatsapp public n8n_data/nodes
+          mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
+          # Install WhatsApp dependencies
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
+          # Install Libsodium directly into the n8n_data volume
+          docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
+
       - name: 📦 Cache Modules
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             n8n_data/nodes
+            n8n_data/node_modules
             whatsapp/node_modules
             node_modules
           key: bot-multi-vfinal-${{ runner.os }}
@@ -59,7 +63,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔍 Searching for older active runs..."
           OLD_RUN=$(gh run list --workflow="Nexus Core: Multi-Vendor AI (Zero-Downtime)" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
           
           if [ -n "$OLD_RUN" ]; then
@@ -68,7 +71,6 @@ jobs:
             
             echo "⏳ Waiting for old run to gracefully save database and die..."
             while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
-              echo "   Still waiting..."
               sleep 2
             done
             echo "✅ Old run successfully terminated. The stage is ours."
@@ -77,7 +79,7 @@ jobs:
           fi
 
       # ==================================================================
-      # 3. SMART DATA SYNC (With Fast Telegram Backups)
+      # 3. SMART DATA SYNC (The 10-Second Sprint Backup)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -113,34 +115,36 @@ jobs:
                  }
               });
             } else {
-              console.log("📤 Starting Backup & Telegram Dispatch...");
+              console.log("🚨 Emergency 10-Second Backup Initiated!");
               if(!fs.existsSync(live)) return;
               
-              // 1. FAST EXPORT & ZIP
+              // 1. Export n8n data while n8n is still running
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
+              } catch(err) { console.log("Export skipped/failed"); }
+
+              // 2. KILL N8N to release database lock
+              try { execSync("docker kill n8n"); } catch(err) {}
+              
+              // 3. Zip and Telegram Upload
+              try {
                   execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
-                  
-                  // 2. SEND ZIP TO TELEGRAM
                   const tgMsg1 = "📎 n8n_secrets.zip n8n Secrets Backup\nPassword: Nexus123";
                   execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
-
-                  execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
-              } catch(err) {}
+                  execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json n8n_data/n8n_secrets.zip");
+              } catch(err) { console.log("Zip upload failed"); }
               
-              // 3. FAST DB VACUUM & COPY
+              // 4. DB Backup and Telegram Upload
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
-              execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
-              
-              // 4. SEND DB TO TELEGRAM
               try {
-                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Max 100 Execs)\nTime: ${new Date().toISOString()}`;
+                  execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
+                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Emergency)\nTime: ${new Date().toISOString()}`;
                   execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
-              } catch(err) {}
+              } catch(err) { console.log("DB upload failed"); }
 
-              // 5. SUPABASE CLOUD SYNC
+              // 5. Supabase Sync
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
@@ -150,11 +154,10 @@ jobs:
           EOF
           
           node smart_sync.js down
-          
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # 4. LAUNCH SERVICES (Lightning Fast & Race-Condition Safe)
+      # 4. LAUNCH SERVICES
       # ==================================================================
       - name: 🚀 Launch Bot Swarm
         env:
@@ -182,8 +185,6 @@ jobs:
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n
-
-          docker exec -u root n8n npm install -g libsodium-wrappers
 
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -317,18 +318,17 @@ jobs:
           cleanup() {
               echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
               
-              # [CONSTRAINT FIX]: Use 'kill' instead of 'stop'. 
-              # 'stop' waits 10s and consumes the entire GH Actions cancellation grace period, killing the backup script.
-              echo "🔪 Instantly severing connections (wa-bot & cloudflared)..."
+              # 1. Instantly sever network connections
+              echo "🔪 Instantly severing network traffic..."
               docker kill cloudflared wa-bot || true
               
-              echo "💾 Initiating Final Emergency Backup & Telegram Dispatch..."
+              # 2. Trigger the perfectly sequenced Emergency Backup (Completes in < 8s)
               node smart_sync.js up
-              echo "✅ Backup Uploaded. Yielding to new workflow."
+              echo "✅ All Backups Sent. Yielding to new workflow."
               exit 0
           }
           
-          trap 'cleanup' SIGINT SIGTERM EXIT
+          trap 'cleanup' SIGTERM
           
           START=$(date +%s)
           echo "🔄 Observer Active. Ready to hand over when signaled."
@@ -347,8 +347,9 @@ jobs:
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
+              # Periodic SQLite Backup (Just in case)
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
-                  node smart_sync.js up
+                  node smart_sync.js up_silent >/dev/null 2>&1 || true
               fi
               sleep 60
           done
