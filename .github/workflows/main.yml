@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ==================================================================
-      # 1. PRE-FLIGHT (Setup environment & Pre-compile Libsodium)
+      # 1. PRE-FLIGHT (Setup environment & Inject Libsodium)
       # ==================================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
@@ -40,10 +40,10 @@ jobs:
           mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          # Install WhatsApp dependencies
+          # Compile WhatsApp Dependencies
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
-          # Install Libsodium directly into the n8n_data volume
+          # [LIBSODIUM FIX]: Pre-install directly inside the n8n_data persistent volume
           docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
       - name: 📦 Cache Modules
@@ -57,29 +57,30 @@ jobs:
           key: bot-multi-vfinal-${{ runner.os }}
 
       # ==================================================================
-      # 2. THE HANDOVER (Active Kill Switch)
+      # 2. THE TAKEOVER PROTOCOL (New Bot Waits for Old Bot)
       # ==================================================================
-      - name: 🤝 Execute Handover Protocol
+      - name: 🤝 Wait for Active Bot to Complete Handover
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          OLD_RUN=$(gh run list --workflow="Nexus Core: Multi-Vendor AI (Zero-Downtime)" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
+          OLDER_RUNS=$(gh run list --workflow="main.yml" --status=in_progress --json databaseId -q "[.[] | select(.databaseId < ${{ github.run_id }})] | .[].databaseId")
           
-          if [ -n "$OLD_RUN" ]; then
-            echo "⚡ Found old run ID: $OLD_RUN. Sending Kill Signal..."
-            gh run cancel $OLD_RUN
-            
-            echo "⏳ Waiting for old run to gracefully save database and die..."
-            while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
-              sleep 2
+          if [ -n "$OLDER_RUNS" ]; then
+            for OLD_RUN in $OLDER_RUNS; do
+              echo "⏳ Found active older bot ($OLD_RUN). Waiting patiently for it to gracefully save data and exit..."
+              while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
+                echo "   ...Old bot is finalizing backup..."
+                sleep 5
+              done
+              echo "✅ Older bot ($OLD_RUN) safely terminated."
             done
-            echo "✅ Old run successfully terminated. The stage is ours."
+            echo "🚀 The stage is fully cleared. Taking over!"
           else
             echo "🟢 No older runs found. Starting fresh."
           fi
 
       # ==================================================================
-      # 3. SMART DATA SYNC (The 10-Second Sprint Backup)
+      # 3. SMART DATA SYNC (The Brains of the Backup)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -106,7 +107,7 @@ jobs:
 
           async function run(mode) {
             if(mode==='down') {
-              console.log("📥 Downloading Data...");
+              console.log("📥 Downloading Database from Supabase...");
               await retry(async () => {
                  const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
                  if(!error) {
@@ -114,37 +115,33 @@ jobs:
                    try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
                  }
               });
-            } else {
-              console.log("🚨 Emergency 10-Second Backup Initiated!");
-              if(!fs.existsSync(live)) return;
-              
-              // 1. Export n8n data while n8n is still running
+            } else if (mode === 'live_backup') {
+              // [USER LOGIC]: Heavy backup happens HERE while bot is STILL ALIVE
+              console.log("📤 [PHASE 1] Starting LIVE Heavy Backup (No Downtime)...");
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
-              } catch(err) { console.log("Export skipped/failed"); }
-
-              // 2. KILL N8N to release database lock
-              try { execSync("docker kill n8n"); } catch(err) {}
-              
-              // 3. Zip and Telegram Upload
-              try {
                   execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
+                  
                   const tgMsg1 = "📎 n8n_secrets.zip n8n Secrets Backup\nPassword: Nexus123";
                   execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json n8n_data/n8n_secrets.zip");
-              } catch(err) { console.log("Zip upload failed"); }
+              } catch(err) { console.log("Live export skipped/failed"); }
               
-              // 4. DB Backup and Telegram Upload
+            } else if (mode === 'final_db_sync') {
+              // [USER LOGIC]: Final DB sync happens after connections are cut
+              console.log("📤 [PHASE 3] Starting FINAL DB SYNC (Bot is now offline)...");
+              if(!fs.existsSync(live)) return;
+              
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
+              
               try {
                   execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
-                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Emergency)\nTime: ${new Date().toISOString()}`;
+                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Max 100 Execs)\nTime: ${new Date().toISOString()}`;
                   execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
-              } catch(err) { console.log("DB upload failed"); }
+              } catch(err) { console.log("DB SQLite copy failed"); }
 
-              // 5. Supabase Sync
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
@@ -304,10 +301,10 @@ jobs:
           
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
           
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Ultra-Fast Handover Complete)" -d parse_mode="HTML"
+          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Handover Complete)" -d parse_mode="HTML"
 
       # ==================================================================
-      # 5. OBSERVER LOOP (With strict graceful shutdown trap)
+      # 5. THE SELF-AWARE OBSERVER (Zero Session Collision & Data Loss Logic)
       # ==================================================================
       - name: 🔄 Observer Loop
         env:
@@ -315,41 +312,50 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
-          cleanup() {
-              echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
-              
-              # 1. Instantly sever network connections
-              echo "🔪 Instantly severing network traffic..."
-              docker kill cloudflared wa-bot || true
-              
-              # 2. Trigger the perfectly sequenced Emergency Backup (Completes in < 8s)
-              node smart_sync.js up
-              echo "✅ All Backups Sent. Yielding to new workflow."
-              exit 0
-          }
-          
-          trap 'cleanup' SIGTERM
-          
           START=$(date +%s)
-          echo "🔄 Observer Active. Ready to hand over when signaled."
+          echo "🔄 Observer Active. Serving Clients and watching for incoming handover signals..."
           
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
+              # Condition 1: Normal Auto-Handover (5 hours 50 mins)
               if [ $DIFF -ge 21000 ]; then
-                  echo "⏰ Time limit (5h 50m) approaching. Triggering Handover..."
+                  echo "⏰ Time limit (5h 50m) reached. Triggering a fresh bot..."
                   gh workflow run main.yml
-                  sleep 300 
-                  exit 0
+                  sleep 60 # Give the new bot time to wake up and fetch images
+                  break # Exit loop to run Graceful Shutdown
+              fi
+              
+              # Condition 2: Did someone MANUALLY start a new workflow from GitHub?
+              NEWER_RUNS=$(gh run list --workflow="main.yml" --status=in_progress --json databaseId -q "[.[] | select(.databaseId > ${{ github.run_id }})] | length")
+              if [ "$NEWER_RUNS" -gt 0 ]; then
+                  echo "🔄 Newer manual run detected! Preparing to yield the stage..."
+                  break # Exit loop to run Graceful Shutdown
               fi
               
               if ! docker ps | grep -q wa-bot; then docker restart wa-bot; fi
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
-              # Periodic SQLite Backup (Just in case)
-              if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
-                  node smart_sync.js up_silent >/dev/null 2>&1 || true
-              fi
-              sleep 60
+              sleep 30
           done
+          
+          # =========================================================
+          # 🛑 THE GRACEFUL SHUTDOWN SEQUENCE (User Logic Applied)
+          # =========================================================
+          
+          # PHASE 1: Heavy Backup WHILE BOT IS STILL ONLINE (Zero Data Loss, Zero Downtime)
+          echo "💾 [PHASE 1] Backing up heavy n8n JSON files while system is still LIVE..."
+          node smart_sync.js live_backup
+          
+          # PHASE 2: Kill Network Connections (Prevents Session Collision & locks the DB)
+          echo "🔪 [PHASE 2] Instantly severing network traffic (wa-bot, n8n, cloudflared)..."
+          docker kill cloudflared wa-bot n8n || true
+          
+          # PHASE 3: Fast SQLite Backup (Bot is now safely offline)
+          echo "💾 [PHASE 3] Uploading exact, locked SQLite state..."
+          node smart_sync.js final_db_sync
+          
+          # PHASE 4: Final Exit (This signals the waiting New Bot to take over instantly)
+          echo "✅ Handover Data Saved & Connections Cut. Exiting so the New Bot can take over!"
+          exit 0
