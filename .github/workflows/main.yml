@@ -41,11 +41,12 @@ jobs:
           mkdir -p whatsapp public n8n_data/nodes
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg && npm install"
+          # [CONSTRAINT FIX & ALPINE FIX]: Injecting Build-Base & libc6-compat for flawless native module compilation
+          docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
           echo "🔐 Compiling Libsodium for n8n Crypto Engine..."
-          # [CONSTRAINT FIX]: Using node:20-alpine instead of n8nio/n8n to prevent EACCES config generation errors.
-          docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine npm install libsodium-wrappers
+          # [ALPINE FIX]: Adding Python & Build tools for native bindings. Using node:20-alpine avoids n8n image EACCES errors.
+          docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ && npm install libsodium-wrappers"
 
       - name: 📦 Cache Modules
         uses: actions/cache@v3
@@ -93,7 +94,7 @@ jobs:
         run: |
           cat << 'EOF' > smart_sync.js
           const { createClient } = require('@supabase/supabase-js');
-          const fs = require('fs'); const { execSync, spawnSync } = require('child_process');
+          const fs = require('fs'); const { execSync } = require('child_process');
           
           const sbUrl = process.env.SUPABASE_URL;
           if (!sbUrl) process.exit(1);
@@ -303,7 +304,8 @@ jobs:
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" node:20-alpine sh -c "apk add --no-cache ffmpeg && node index.js"
+          # [CONSTRAINT FIX]: Added tzdata for accurate WhatsApp timestamps
+          docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
           
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Ultra-Fast Handover Complete)" -d parse_mode="HTML"
 
