@@ -18,7 +18,7 @@ jobs:
 
       # ============================================================
       # 1) BASE SETUP
-      # - Runner optimization
+      # - Safe runner optimization
       # - Required packages
       # - Node dependency for smart_sync.js
       # ============================================================
@@ -26,10 +26,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo fallocate -l 4G /swapfile || true
-          sudo chmod 600 /swapfile || true
-          sudo mkswap /swapfile || true
-          sudo swapon /swapfile || true
+          # Safe swap setup: create only if not already active
+          if ! swapon --show | grep -q '/swapfile'; then
+            sudo fallocate -l 4G /swapfile || true
+            sudo chmod 600 /swapfile || true
+            sudo mkswap /swapfile || true
+            sudo swapon /swapfile || true
+          fi
 
           sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
@@ -43,7 +46,7 @@ jobs:
 
       # ============================================================
       # 2) CACHE RESTORE
-      # - Must be BEFORE heavy pulls/builds
+      # - Must run BEFORE heavy pulls/builds
       # ============================================================
       - name: 📦 Cache Modules
         uses: actions/cache@v4
@@ -52,11 +55,11 @@ jobs:
             n8n_data/node_modules
             whatsapp/node_modules
             node_modules
-          key: nexus-core-cache-${{ runner.os }}-v7
+          key: nexus-core-cache-${{ runner.os }}-v8
 
       # ============================================================
-      # 3) PRE-WARM IMAGES + DEPENDENCIES
-      # - Old bot stays live while new run prepares
+      # 3) PRE-WARM DEPENDENCIES
+      # - Old bot remains live during this phase
       # ============================================================
       - name: 🐋 Pre-Fetch Docker Images & Dependencies
         run: |
@@ -85,18 +88,18 @@ jobs:
           }
           EOF
 
-          # Compile WhatsApp bot dependencies
+          # Build WhatsApp bot dependencies
           docker run --rm -v "$(pwd)/whatsapp:/app" -w /app node:20-alpine \
             sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
 
-          # Install libsodium inside mounted n8n volume
+          # Install libsodium inside the mounted n8n volume
           docker run --rm -v "$(pwd)/n8n_data:/n8n_data" -w /n8n_data node:20-alpine \
             sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
       # ============================================================
       # 4) HANDOVER REQUEST
-      # - Scan multiple active-like states
-      # - Cancel old run
+      # - Detect older active-like runs
+      # - Cancel them safely
       # - Abort if old run does not exit in time
       # ============================================================
       - name: 🤝 Execute Handover Protocol
@@ -152,8 +155,8 @@ jobs:
 
       # ============================================================
       # 5) DATA LAYER
-      # - Versioned SQLite snapshot model
-      # - latest.json pointer model
+      # - Versioned SQLite snapshots
+      # - latest.json pointer
       # - No VACUUM / No Telegram in fast handover path
       # ============================================================
       - name: 💾 Setup Data Layer
@@ -183,7 +186,7 @@ jobs:
           const sb = createClient(sbUrl, sbKey);
 
           function sleep(ms) {
-            return new Promise(r => setTimeout(r, ms));
+            return new Promise((resolve) => setTimeout(resolve, ms));
           }
 
           async function retry(fn, retries = 3, delay = 1500) {
@@ -205,7 +208,7 @@ jobs:
 
           function buildStamp() {
             const d = new Date();
-            const pad = n => String(n).padStart(2, '0');
+            const pad = (n) => String(n).padStart(2, '0');
             return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}_${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
           }
 
@@ -243,13 +246,13 @@ jobs:
 
             if (fs.existsSync(safe)) fs.unlinkSync(safe);
 
-            # Use SQLite online backup to produce a safe copy
+            // Use SQLite online backup to create a safe copy
             execSync(`sqlite3 "${live}" ".backup '${safe}'"`);
 
             const stamp = buildStamp();
             const snapPath = `snapshots/db_${stamp}.sqlite`;
 
-            # Step 1: upload versioned DB snapshot
+            // Step 1: upload versioned DB snapshot
             await retry(async () => {
               const { error } = await sb.storage.from(bucket).upload(
                 snapPath,
@@ -262,7 +265,7 @@ jobs:
               if (error) throw error;
             });
 
-            # Step 2: update tiny pointer only after snapshot success
+            // Step 2: update tiny pointer only after snapshot upload success
             const pointer = {
               path: snapPath,
               generated_at: new Date().toISOString()
@@ -324,20 +327,20 @@ jobs:
             if (mode === 'up_full') await uploadFull();
           }
 
-          main().catch(() => process.exit(0));
+          main().catch((err) => {
+            console.error(err?.message || err);
+            process.exit(1);
+          });
           EOF
 
-          # Download latest safe snapshot before boot
           node smart_sync.js down || true
           sudo chmod -R 755 n8n_data whatsapp
 
       # ============================================================
       # 6) LAUNCH STACK
-      # IMPORTANT:
-      # - Start app containers first
-      # - Verify local origin health
+      # - Start apps first
+      # - Wait for local health
       # - Start cloudflared LAST
-      # This avoids exposing a dead origin and reduces 502 startup errors
       # ============================================================
       - name: 🚀 Launch Bot Swarm
         env:
@@ -351,9 +354,7 @@ jobs:
           docker network create bot-net || true
           docker rm -f cloudflared n8n caddy wa-bot >/dev/null 2>&1 || true
 
-          # -------------------------
-          # Start n8n FIRST
-          # -------------------------
+          # Start n8n first
           docker run -d --name n8n --network bot-net --restart unless-stopped \
             -v "$(pwd)/n8n_data:/home/node/.n8n" \
             -e N8N_HOST="0.0.0.0" \
@@ -373,9 +374,7 @@ jobs:
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n:latest
 
-          # -------------------------
-          # Build WhatsApp bridge app
-          # -------------------------
+          # Write WhatsApp bridge app
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion, initAuthCreds } = require('@whiskeysockets/baileys');
           const express = require('express');
@@ -466,9 +465,9 @@ jobs:
               try {
                 await axios.post(N8N_URL, payload, { timeout: 10000 });
                 return;
-              } catch (err) {
+              } catch {
                 if (i === retries - 1) return;
-                await new Promise(r => setTimeout(r, 4000));
+                await new Promise((r) => setTimeout(r, 4000));
               }
             }
           }
@@ -492,10 +491,7 @@ jobs:
             sock.ev.on('connection.update', (u) => {
               if (u.qr) qrs[v] = u.qr;
               if (u.connection === 'open') qrs[v] = null;
-              if (
-                u.connection === 'close' &&
-                u.lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-              ) {
+              if (u.connection === 'close' && u.lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
                 setTimeout(() => start(v), 5000);
               }
             });
@@ -545,18 +541,14 @@ jobs:
           });
           EOF
 
-          # -------------------------
           # Start wa-bot
-          # -------------------------
           docker run -d --name wa-bot --network bot-net --restart unless-stopped \
             -v "$(pwd)/whatsapp:/app" -w /app \
             -e MONGODB_URI="$MONGODB_URI" \
             -e TZ="Asia/Kolkata" \
             node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
 
-          # -------------------------
-          # Start Caddy reverse proxy
-          # -------------------------
+          # Start Caddy
           cat << 'EOF' > Caddyfile
           :80 {
             reverse_proxy /qr* wa-bot:10000
@@ -571,10 +563,7 @@ jobs:
             -v "$(pwd)/Caddyfile:/etc/caddy/Caddyfile" \
             caddy:latest
 
-          # -------------------------
-          # Health check BEFORE tunnel start
-          # This is the main fix against startup 502 errors
-          # -------------------------
+          # Wait for local health BEFORE exposing tunnel
           echo "⏳ Waiting for local origin to become healthy..."
           for i in $(seq 1 60); do
             ROOT_OK=0
@@ -599,12 +588,11 @@ jobs:
             sleep 5
           done
 
-          # -------------------------
           # Start cloudflared LAST
-          # -------------------------
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token "$CF_TOKEN"
 
+          # Optional startup notification
           curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
             -d chat_id="$TG_ID" \
             -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Handover Complete)" \
@@ -612,7 +600,7 @@ jobs:
 
       # ============================================================
       # 7) OBSERVER LOOP
-      # - Handles handover signals
+      # - Handles kill signals from next run
       # - Stops n8n FIRST
       # - Uses short polling instead of sleep 300
       # ============================================================
@@ -635,15 +623,15 @@ jobs:
             touch /tmp/backup_done
             echo "🛑 Kill signal received. Starting safe handover..."
 
-            # 1) Stop n8n FIRST so SQLite writes stop immediately
+            # Stop n8n first so SQLite writes stop immediately
             echo "🧊 Step 1: Stop n8n first"
             docker kill n8n >/dev/null 2>&1 || true
 
-            # 2) Then cut traffic
+            # Then stop traffic-facing containers
             echo "📵 Step 2: Stop wa-bot, caddy, and cloudflared"
             docker kill wa-bot caddy cloudflared >/dev/null 2>&1 || true
 
-            # 3) Fast path: only upload versioned DB snapshot + pointer
+            # Fast handover path: versioned DB snapshot + pointer only
             echo "💾 Step 3: Upload versioned snapshot"
             timeout 8s node smart_sync.js up_fast || true
 
@@ -664,7 +652,7 @@ jobs:
             NOW=$(date +%s)
             DIFF=$((NOW - START))
 
-            # Trigger next run before GitHub hard timeout
+            # Trigger next workflow before GitHub hard timeout
             if [ $DIFF -ge 21000 ] && [ $HANDOVER_SENT -eq 0 ]; then
               echo "⏰ Time limit approaching. Triggering next workflow..."
               gh workflow run "${{ github.workflow }}" || true
@@ -672,7 +660,7 @@ jobs:
               HANDOVER_TS=$NOW
             fi
 
-            # If next workflow doesn't take over, continue serving and do NOT force split-brain
+            # If next run doesn't take over, keep serving and avoid split-brain
             if [ $HANDOVER_SENT -eq 1 ] && [ $((NOW - HANDOVER_TS)) -ge 300 ]; then
               echo "⚠️ New workflow did not take over within 5 minutes. Resetting trigger and continuing."
               HANDOVER_SENT=0
@@ -694,3 +682,4 @@ jobs:
 
             sleep 10
           done
+
