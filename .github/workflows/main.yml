@@ -79,7 +79,7 @@ jobs:
           fi
 
       # ==================================================================
-      # 3. SMART DATA SYNC (Download Fresh DB immediately after old dies)
+      # 3. SMART DATA SYNC (With Telegram Backups)
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -119,20 +119,30 @@ jobs:
               console.log("📤 Starting Backup...");
               if(!fs.existsSync(live)) return;
               
-              // [CONSTRAINT]: Security - Delete unencrypted keys immediately after zip
+              // [CONSTRAINT]: Security - Export workflows, zip them, send to Telegram, delete unencrypted keys
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
                   execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
+                  
+                  // Telegram Backup: Workflows & Credentials
+                  const tgMsg1 = "📎 n8n_secrets.zip n8n Secrets Backup\nPassword: Nexus123";
+                  execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
+
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json");
               } catch(err) {}
               
-              // [CONSTRAINT]: Storage - Vacuum DB to keep file size small for fast uploads
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
 
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
               execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
               
+              // Telegram Backup: SQLite Database
+              try {
+                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Max 100 Execs)\nTime: ${new Date().toISOString()}`;
+                  execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
+              } catch(err) {}
+
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
@@ -173,6 +183,9 @@ jobs:
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             n8nio/n8n
+
+          # [CONSTRAINT]: Install Libsodium inside n8n for SaaS API Key Encryption
+          docker exec -u node n8n npm install libsodium-wrappers --prefix /home/node/.n8n
 
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -222,16 +235,14 @@ jobs:
               };
           }
 
-          // [CONSTRAINT FIX]: Smart Webhook Retry Logic
-          // REASON: wa-bot boots in 2s, but n8n takes 15s. This prevents dropping messages during handover.
           async function sendWebhookWithRetry(payload, retries = 5) {
               for (let i = 0; i < retries; i++) {
                   try {
                       await axios.post(N8N_URL, payload);
-                      return; // Success!
+                      return;
                   } catch (err) {
                       if (i === retries - 1) console.error("Webhook failed completely after retries.");
-                      else await new Promise(r => setTimeout(r, 4000)); // Wait 4 seconds before next try
+                      else await new Promise(r => setTimeout(r, 4000));
                   }
               }
           }
@@ -255,8 +266,6 @@ jobs:
               sock.ev.on('messages.upsert', async ({ messages }) => {
                   const msg = messages[0]; 
                   if(!msg.message || msg.key.fromMe) return;
-                  
-                  // Use the new retry function instead of a single fire-and-forget axios call
                   await sendWebhookWithRetry({ vendor: v, full_json: msg });
               });
           }
@@ -294,7 +303,6 @@ jobs:
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          # [CONSTRAINT FIX]: No npm install here. Pre-compiled node_modules are used for instantaneous 0-second boot.
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" node:20-alpine sh -c "apk add --no-cache ffmpeg && node index.js"
           
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Ultra-Fast Handover Complete)" -d parse_mode="HTML"
@@ -311,8 +319,6 @@ jobs:
           cleanup() {
               echo "🛑 STOP SIGNAL RECEIVED (from new workflow or timeout)"
               
-              # [CONSTRAINT]: Split-Brain & Flapping Prevention
-              # REASON: Must immediately kill network-facing containers before backing up DB
               echo "🔪 Instantly severing connections (wa-bot & cloudflared)..."
               docker stop cloudflared wa-bot || true
               
@@ -322,7 +328,6 @@ jobs:
               exit 0
           }
           
-          # TRAP: This catches the 'gh run cancel' command sent by the new workflow
           trap 'cleanup' SIGINT SIGTERM EXIT
           
           START=$(date +%s)
@@ -331,16 +336,10 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # [CONSTRAINT]: 5h 50m (21000s) Handover Timer. Leaves 10 mins buffer before GH 6h hard-kill.
               if [ $DIFF -ge 21000 ]; then
                   echo "⏰ Time limit (5h 50m) approaching. Triggering Handover..."
-                  # IMPORTANT: Ensure your workflow file is exactly named 'main.yml' in the repo
                   gh workflow run main.yml
-                  
-                  # Buffer: Wait up to 5 mins for new bot to boot and send the kill signal to THIS run
                   sleep 300 
-                  
-                  # If new bot fails to kill this run after 5 mins, exit gracefully (triggers trap backup)
                   exit 0
               fi
               
@@ -348,7 +347,6 @@ jobs:
               if ! docker ps | grep -q n8n; then docker restart n8n; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared; fi
               
-              # Periodic Backup every 15 mins
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   node smart_sync.js up
               fi
