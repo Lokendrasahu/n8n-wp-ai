@@ -13,11 +13,24 @@ jobs:
     timeout-minutes: 360 
     
     steps:
+      # ==================================================================
+      # [CONSTRAINT]: EARLY CACHE RESTORE (Must be at the top to save Boot Time)
+      # ==================================================================
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: 📦 Cache Modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            n8n_data/nodes
+            n8n_data/node_modules
+            whatsapp/node_modules
+            node_modules
+          key: bot-multi-vfinal-${{ runner.os }}
+
       # ==================================================================
-      # 1. PRE-FLIGHT (Setup environment & Pre-compile everything)
+      # [CONSTRAINT]: INVISIBLE PRE-WARM (Old Bot is still 100% LIVE here)
       # ==================================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
@@ -31,7 +44,7 @@ jobs:
 
       - name: 🐋 Pre-Fetch Docker Images & Dependencies
         run: |
-          echo "📥 Downloading massive images in background (Old bot is still LIVE)..."
+          echo "📥 Downloading massive images in background..."
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
           docker pull caddy:latest
@@ -40,47 +53,39 @@ jobs:
           mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
-          # Compile WhatsApp Dependencies
+          # Native compilation for WhatsApp & Libsodium DONE BEFORE taking over
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
-
-          # Pre-install Libsodium securely in the mapped volume
           docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
-      - name: 📦 Cache Modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            n8n_data/nodes
-            n8n_data/node_modules
-            whatsapp/node_modules
-            node_modules
-          key: bot-multi-vfinal-${{ runner.os }}
-
       # ==================================================================
-      # 2. THE HANDOVER (Active Kill Switch - No Deadlocks!)
+      # [CONSTRAINT]: MULTI-STATE OLD RUN DETECTION (No Blind Spots)
       # ==================================================================
       - name: 🤝 Execute Handover Protocol
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Naya bot pehle search karega ki purana bot kahan hai
-          OLD_RUN=$(gh run list --workflow="main.yml" --status=in_progress --json databaseId -q ".[] | select(.databaseId != ${{ github.run_id }}) | .databaseId" | head -n 1)
+          echo "🔍 Scanning for existing bots (in_progress, queued, waiting, requested)..."
+          OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
           
-          if [ -n "$OLD_RUN" ]; then
-            echo "⚡ Found old run ID: $OLD_RUN. Sending Kill Signal to trigger its backup..."
+          if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
+            echo "⚡ Found active run ID: $OLD_RUN. Sending Kill Signal..."
             gh run cancel $OLD_RUN
             
-            echo "⏳ Waiting for old bot to sever connections, upload DB, and die..."
-            while gh run view $OLD_RUN --json status -q '.status' | grep -q "in_progress"; do
-              sleep 2
+            echo "⏳ Waiting for old bot to freeze n8n, upload DB, and exit (Max 3 Mins)..."
+            for i in {1..36}; do
+              STATUS=$(gh run view $OLD_RUN --json status -q '.status' 2>/dev/null || echo "completed")
+              if [ "$STATUS" != "in_progress" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "waiting" ]; then 
+                echo "✅ Old bot safely terminated!"
+                break
+              fi
+              sleep 5
             done
-            echo "✅ Old bot successfully terminated. Connections are free. Taking over!"
           else
-            echo "🟢 No older runs found. Starting fresh."
+            echo "🟢 No older runs found. Processing as Absolute Fresh Run."
           fi
 
       # ==================================================================
-      # 3. SMART DATA SYNC (Fast Download & Safe Uploads)
+      # [CONSTRAINT]: VERSIONED SNAPSHOTS & STALE-SAFE POINTER
       # ==================================================================
       - name: 💾 Setup Data Layer
         env:
@@ -88,6 +93,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}
         run: |
           cat << 'EOF' > smart_sync.js
           const { createClient } = require('@supabase/supabase-js');
@@ -97,7 +103,7 @@ jobs:
           if (!sbUrl) process.exit(1);
 
           const sb = createClient(sbUrl, process.env.SUPABASE_KEY);
-          const live='n8n_data/database.sqlite', safe='n8n_data/db_snap.sqlite';
+          const live='n8n_data/database.sqlite';
 
           async function retry(fn) {
             for (let i=0; i<3; i++) {
@@ -107,43 +113,72 @@ jobs:
 
           async function run(mode) {
             if(mode==='down') {
-              console.log("📥 Downloading Latest Database...");
+              console.log("📥 Fetching secure pointer (latest.json) with Cache-Busting...");
+              let pointerFound = false;
+              
               await retry(async () => {
-                 const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
-                 if(!error) {
-                   fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
-                   try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
+                 // ?t= avoids Supabase CDN Stale Read
+                 const { data: pData, error: pErr } = await sb.storage.from('bot-storage').download('latest.json?t=' + Date.now());
+                 if(!pErr && pData) {
+                    try {
+                      const text = await pData.text();
+                      const { latest } = JSON.parse(text);
+                      if (latest) {
+                        pointerFound = true;
+                        console.log(`📥 Downloading exact versioned DB: ${latest}`);
+                        const { data, error } = await sb.storage.from('bot-storage').download(latest);
+                        if(!error) {
+                          fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
+                          try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
+                        }
+                      }
+                    } catch (err) {}
                  }
               });
+              
+              if (!pointerFound) {
+                 console.log("ℹ️ No previous database/pointer found. Treating as ABSOLUTE FRESH RUN.");
+              }
+              
             } else if (mode === 'up_fast') {
-              // HANDOVER MODE: Extremely fast. Only DB sync. Fits in 10-second GH window.
-              console.log("📤 Handover Backup: Uploading SQLite DB instantly...");
+              // [CONSTRAINT]: Fast Handover Path - Only SQLite. NO ZIP OR TELEGRAM HERE.
+              console.log("📤 [FAST SYNC] Taking Versioned Snapshot...");
+              if(!fs.existsSync(live)) return;
+              
+              const stats = fs.statSync(live);
+              if (stats.size < 20480) { // Safety: Don't upload blank <20KB DB
+                  console.error("🚨 DB too small. Refusing to upload to prevent wipeout.");
+                  process.exit(1);
+              }
+              
+              const dbName = `db_${Date.now()}.sqlite`;
+              
+              await retry(async () => {
+                 await sb.storage.from('bot-storage').upload(dbName, fs.readFileSync(live), { upsert: false });
+              });
+              
+              console.log("📤 [FAST SYNC] Updating Pointer...");
+              await retry(async () => {
+                 await sb.storage.from('bot-storage').upload('latest.json', Buffer.from(JSON.stringify({ latest: dbName })), { upsert: true, contentType: 'application/json' });
+              });
+              
+            } else if (mode === 'up_full') {
+              // [CONSTRAINT]: Periodic Path (Background every 15 mins)
+              console.log("📤 [PERIODIC] Exporting ZIP, DB and sending to Telegram...");
               if(!fs.existsSync(live)) return;
               
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
-              if(fs.existsSync(safe)) fs.unlinkSync(safe);
-              
-              try {
-                  execSync("sqlite3 " + live + " \".backup '" + safe + "'\"");
-                  const tgMsg2 = `📎 n8n_backup.sqlite Backup Saved (Emergency Fast-Sync)\nTime: ${new Date().toISOString()}`;
-                  execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
-              } catch(err) {}
-
-              await retry(async () => {
-                 await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
-              });
-            } else if (mode === 'up_full') {
-              // PERIODIC MODE: Heavy Zip Backup. Runs every 15 mins to keep secrets safe.
-              console.log("📤 Periodic Backup: Exporting JSONs & Zipping...");
-              if(!fs.existsSync(live)) return;
-              
               try {
                   execSync("docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json");
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
-                  execSync("cd n8n_data && zip -P Nexus123 n8n_secrets.zip creds_decrypted.json workflows.json");
+                  execSync(`cd n8n_data && zip -P ${process.env.ZIP_PASS} n8n_secrets.zip creds_decrypted.json workflows.json`);
                   
-                  const tgMsg1 = "📎 n8n_secrets.zip n8n Secrets Backup\nPassword: Nexus123";
+                  const tgMsg1 = `📎 Periodic Backup: n8n Secrets\nPassword: ${process.env.ZIP_PASS}`;
                   execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
+                  
+                  const tgMsg2 = `📎 Periodic Backup: SQLite DB\nTime: ${new Date().toISOString()}`;
+                  execSync(`curl -s -F document=@${live} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
+                  
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json n8n_data/n8n_secrets.zip");
               } catch(err) {}
             }
@@ -155,7 +190,7 @@ jobs:
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # 4. LAUNCH SERVICES
+      # [CONSTRAINT]: LAUNCH SERVICES FIRST (Zero Session Collision)
       # ==================================================================
       - name: 🚀 Launch Bot Swarm
         env:
@@ -302,10 +337,46 @@ jobs:
           
           docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
           
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Handover Complete)" -d parse_mode="HTML"
+          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Takeover Successful)" -d parse_mode="HTML"
 
       # ==================================================================
-      # 5. OBSERVER LOOP (Traps the Kill Signal from New Bot)
+      # [CONSTRAINT]: STARTUP TELEGRAM BACKUP (Includes n8n Key for Emergency)
+      # ==================================================================
+      - name: 📩 Dispatch Telegram Backups & Keys
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}
+          N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
+        run: |
+          echo "📤 Bot is LIVE! Executing heavy Telegram Backups safely in background..."
+          sleep 10 # Wait for n8n to boot and initialize DB fully
+          
+          if [ -f n8n_data/database.sqlite ]; then
+              # 1. Export n8n Data
+              try { docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json; } catch(e){}
+              try { docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json; } catch(e){}
+              
+              cd n8n_data
+              
+              # 2. Zip and Send Secrets + Encryption Key
+              if [ -f workflows.json ]; then
+                  zip -P "$ZIP_PASS" n8n_secrets.zip creds_decrypted.json workflows.json
+                  
+                  CAPTION1=$'📎 n8n_secrets.zip n8n Secrets Backup\nPassword: '"$ZIP_PASS"$'\n🔑 N8N Encryption Key: '"$N8N_KEY"
+                  curl -s -F document=@n8n_secrets.zip -F caption="$CAPTION1" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID
+              fi
+              
+              # 3. Send SQLite DB
+              sqlite3 database.sqlite 'VACUUM;'
+              CAPTION2=$'📎 n8n_backup.sqlite Backup Saved (Start/Handover)\nTime: '$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+              curl -s -F document=@database.sqlite -F caption="$CAPTION2" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID
+              
+              rm -f creds_decrypted.json workflows.json n8n_secrets.zip
+          fi
+
+      # ==================================================================
+      # [CONSTRAINT]: OBSERVER LOOP (n8n-First Freeze & Safe Ext)
       # ==================================================================
       - name: 🔄 Observer Loop
         env:
@@ -314,22 +385,30 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
           cleanup() {
-              echo "🛑 KILL SIGNAL RECEIVED! Initiating Fast Handover..."
+              # Idempotency Lock: Prevent Double-Triggering
+              [ -f /tmp/backup_done ] && exit 0
+              touch /tmp/backup_done
               
-              # 1. Instantly kill network to prevent Session Collision and DB Writes
-              echo "🔪 Instantly severing connections (wa-bot, n8n, cloudflared)..."
-              docker kill cloudflared wa-bot n8n || true
+              echo "🛑 KILL SIGNAL CAUGHT! Initiating Deep Freeze Handover..."
               
-              # 2. Upload the SQLite DB in < 5 seconds before GH force kills the container
-              echo "💾 Initiating Fast DB Sync..."
-              node smart_sync.js up_fast
+              # 1. n8n-First Freeze (Max 3 Seconds to safely lock SQLite)
+              echo "🔒 Stopping n8n to safely lock database..."
+              docker stop -t 3 n8n || true
               
-              echo "✅ Data Synced. Exiting for New Bot takeover."
+              # 2. Instantly Cut Network (Zero Overlap for Sessions)
+              echo "🔪 Severing connections (wa-bot, cloudflared)..."
+              docker kill cloudflared wa-bot || true
+              
+              # 3. Fast Atomic Sync: Timeout guard to respect GitHub kill limits
+              echo "💾 Uploading versioned DB snapshot to Supabase (< 8s window)..."
+              timeout 8 node smart_sync.js up_fast || true
+              
+              echo "✅ Deep Freeze complete. Exiting smoothly."
               exit 0
           }
           
-          # Catch the cancel signal from the new bot
-          trap 'cleanup' SIGTERM
+          # Multi-Signal Trap
+          trap 'cleanup' SIGINT SIGTERM SIGHUP
           
           START=$(date +%s)
           echo "🔄 Observer Active. Serving Clients..."
@@ -337,11 +416,12 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # Auto-Trigger a new bot when time runs out
+              # Auto-Trigger Handover at 5h 50m (21000s)
               if [ $DIFF -ge 21000 ]; then
-                  echo "⏰ Time limit (5h 50m) approaching. Triggering Handover..."
+                  echo "⏰ Time limit reached. Triggering Auto-Handover..."
                   gh workflow run main.yml
-                  sleep 300 # Wait for the new bot to kill this one
+                  # Short polling wait lets trap execute immediately upon receiving signal
+                  for i in {1..60}; do sleep 5; done 
                   exit 0
               fi
               
@@ -349,7 +429,7 @@ jobs:
               if ! docker ps | grep -q n8n; then docker restart n8n > /dev/null; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared > /dev/null; fi
               
-              # Periodic Heavy Backup (Zip) every 15 mins to keep data safe without blocking handover
+              # Periodic Tasks (Every 15 mins)
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   node smart_sync.js up_full >/dev/null 2>&1 || true
               fi
