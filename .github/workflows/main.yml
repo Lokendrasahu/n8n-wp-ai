@@ -1,4 +1,4 @@
-name: "Nexus Core: Multi-Vendor AI (Zero-Downtime)"
+name: "Nexus core"
 
 on:
   workflow_dispatch:
@@ -8,18 +8,19 @@ permissions:
   contents: read
 
 jobs:
-  run-nexus-core:
+  production-deployment:
+    name: "Deploy & Synchronize Node Services"
     runs-on: ubuntu-latest
     timeout-minutes: 360 
     
     steps:
       # ==================================================================
-      # [CONSTRAINT]: EARLY CACHE RESTORE (Fast Boot)
+      # [PHASE 1]: DEPENDENCY CACHING (Optimizes CI/CD Pipeline speed)
       # ==================================================================
-      - name: Checkout Code
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📦 Cache Modules
+      - name: 📦 Restore Module Cache
         uses: actions/cache@v4
         with:
           path: |
@@ -27,12 +28,12 @@ jobs:
             n8n_data/node_modules
             whatsapp/node_modules
             node_modules
-          key: bot-multi-vfinal-${{ runner.os }}
+          key: nexus-prod-cache-${{ runner.os }}
 
       # ==================================================================
-      # [CONSTRAINT]: INVISIBLE PRE-WARM (Old Bot is LIVE here)
+      # [PHASE 2]: ENVIRONMENT PROVISIONING (Background build process)
       # ==================================================================
-      - name: ⚡ Optimize Environment & Setup
+      - name: ⚙️ Provision Virtual Environment
         run: |
           sudo fallocate -l 4G /swapfile || true && sudo chmod 600 /swapfile || true && sudo mkswap /swapfile || true && sudo swapon /swapfile || true
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
@@ -42,51 +43,52 @@ jobs:
           npm config set registry https://registry.npmjs.org/
           npm install @supabase/supabase-js
 
-      - name: 🐋 Pre-Fetch Docker Images & Dependencies
+      - name: 🐋 Pull & Compile Service Images
         run: |
-          echo "📥 Downloading massive images in background..."
+          echo "Preparing microservice containers..."
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
           docker pull caddy:latest
           docker pull node:20-alpine
           
           mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
-          echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
+          echo '{"name":"wa-node","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
+          # Compiling essential native binaries
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
           docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
 
       # ==================================================================
-      # [CONSTRAINT]: SAFE TAKEOVER (Multi-State Detection)
+      # [PHASE 3]: ZERO-DOWNTIME ROLLING UPDATE PROTOCOL
       # ==================================================================
-      - name: 🤝 Execute Handover Protocol
+      - name: 🤝 Execute Stateful Handover
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔍 Scanning for existing bots (in_progress, queued, waiting, requested)..."
+          echo "Scanning for previous deployment state..."
           OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
           
           if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
-            echo "⚡ Found active run ID: $OLD_RUN. Sending Kill Signal..."
+            echo "Previous deployment detected (ID: $OLD_RUN). Initiating graceful state transfer..."
             gh run cancel $OLD_RUN
             
-            echo "⏳ Waiting for old bot to freeze n8n, backup DB, and exit (Max 3 Mins)..."
+            echo "Awaiting state synchronization completion (Max timeout 3m)..."
             for i in {1..36}; do
               STATUS=$(gh run view $OLD_RUN --json status -q '.status' 2>/dev/null || echo "completed")
               if [ "$STATUS" != "in_progress" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "waiting" ]; then 
-                echo "✅ Old bot safely terminated!"
+                echo "State transfer successful. Terminating legacy instance."
                 break
               fi
               sleep 5
             done
           else
-            echo "🟢 No older runs found. Processing as Fresh Run."
+            echo "No active deployments found. Initializing primary boot sequence."
           fi
 
       # ==================================================================
-      # [CONSTRAINT]: THE TRUSTED OLD DB LOGIC (Simple & Reliable)
+      # [PHASE 4]: DATABASE SYNCHRONIZATION (Supabase Native Strategy)
       # ==================================================================
-      - name: 💾 Setup Data Layer
+      - name: 💾 Synchronize Persistent Volumes
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -94,7 +96,7 @@ jobs:
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}
         run: |
-          cat << 'EOF' > smart_sync.js
+          cat << 'EOF' > db_manager.js
           const { createClient } = require('@supabase/supabase-js');
           const fs = require('fs'); const { execSync } = require('child_process');
           
@@ -112,20 +114,19 @@ jobs:
 
           async function run(mode) {
             if(mode==='down') {
-              console.log("📥 Downloading database.sqlite...");
+              console.log("Restoring previous state from Cloud Storage...");
               await retry(async () => {
                  const { data, error } = await sb.storage.from('bot-storage').download('database.sqlite');
                  if(!error && data) {
                    fs.writeFileSync(live, Buffer.from(await data.arrayBuffer()));
                    try { execSync("sqlite3 " + live + " 'PRAGMA journal_mode=WAL;'"); } catch(e) {}
-                   console.log("✅ Database securely mounted!");
+                   console.log("Volume restoration complete.");
                  } else {
-                   console.log("ℹ️ No previous database found. Starting fresh.");
+                   console.log("No existing volume found. Provisioning new database.");
                  }
               });
             } else if (mode === 'up_fast') {
-              // HANDOVER PATH: Extremely fast SQLite native backup
-              console.log("📤 [FAST SYNC] Taking SQLite Snapshot...");
+              console.log("Creating rapid snapshot for rolling update...");
               if(!fs.existsSync(live)) return;
               
               if(fs.existsSync(safe)) fs.unlinkSync(safe);
@@ -134,11 +135,10 @@ jobs:
               await retry(async () => {
                  await sb.storage.from('bot-storage').upload('database.sqlite', fs.readFileSync(safe), { upsert: true });
               });
-              console.log("✅ DB Secured on Supabase.");
+              console.log("Snapshot secured to Cloud Storage.");
               
             } else if (mode === 'up_full') {
-              // PERIODIC PATH: Full ZIP & Telegram (runs every 15 mins)
-              console.log("📤 [PERIODIC] Exporting ZIP and Vacuuming...");
+              console.log("Executing periodic health backup...");
               if(!fs.existsSync(live)) return;
               
               try { execSync("sqlite3 " + live + " 'VACUUM;'"); } catch(e) {}
@@ -154,10 +154,10 @@ jobs:
                   execSync("docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json");
                   execSync(`cd n8n_data && zip -P ${process.env.ZIP_PASS} n8n_secrets.zip creds_decrypted.json workflows.json`);
                   
-                  const tgMsg1 = `📎 Periodic Backup: n8n Secrets\nPassword: ${process.env.ZIP_PASS}`;
+                  const tgMsg1 = `📎 Periodic Backup: Production Secrets\nPassword: ${process.env.ZIP_PASS}`;
                   execSync(`curl -s -F document=@n8n_data/n8n_secrets.zip -F caption="${tgMsg1}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
                   
-                  const tgMsg2 = `📎 Periodic Backup: SQLite DB\nTime: ${new Date().toISOString()}`;
+                  const tgMsg2 = `📎 Periodic Backup: Application DB\nTime: ${new Date().toISOString()}`;
                   execSync(`curl -s -F document=@${safe} -F caption="${tgMsg2}" https://api.telegram.org/bot${process.env.TG_TOKEN}/sendDocument?chat_id=${process.env.TG_ID}`);
                   
                   execSync("rm -f n8n_data/creds_decrypted.json n8n_data/workflows.json n8n_data/n8n_secrets.zip");
@@ -167,24 +167,24 @@ jobs:
           run(process.argv[2]);
           EOF
           
-          node smart_sync.js down
+          node db_manager.js down
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # [CONSTRAINT]: LAUNCH SERVICES (Zero Session Collision)
+      # [PHASE 5]: MICROSERVICES DEPLOYMENT (n8n, Baileys, Cloudflare)
       # ==================================================================
-      - name: 🚀 Launch Bot Swarm
+      - name: 🚀 Deploy Production Services
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          docker network create bot-net || true
+          docker network create prod-net || true
           
           docker run -d --name cloudflared --network host --restart unless-stopped \
             cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
           
-          docker run -d --name n8n --network bot-net --restart unless-stopped \
+          docker run -d --name n8n --network prod-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}" \
             -e WEBHOOK_URL="https://nexusautomation.dpdns.org" \
@@ -314,106 +314,104 @@ jobs:
           EOF
 
           printf ":80 {\n reverse_proxy /qr* wa-bot:10000\n reverse_proxy /reset* wa-bot:10000\n reverse_proxy /health wa-bot:10000\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
-          docker run -d --name caddy --network bot-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
+          docker run -d --name caddy --network prod-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          docker run -d --name wa-bot --network bot-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
+          docker run -d --name wa-bot --network prod-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app -e MONGODB_URI="${{ secrets.MONGODB_URI }}" -e TZ="Asia/Kolkata" node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
           
-          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Takeover Successful)" -d parse_mode="HTML"
+          curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>Deployment Successful @ nexusautomation.dpdns.org</b> (Services Live)" -d parse_mode="HTML"
 
       # ==================================================================
-      # [CONSTRAINT]: STARTUP TELEGRAM BACKUP (Bash Syntax Error Fixed)
+      # [PHASE 6]: SECURE NOTIFICATION & EXPORT
       # ==================================================================
-      - name: 📩 Dispatch Telegram Backups & Keys
+      - name: 📩 Dispatch Secure Configs
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}
           N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
         run: |
-          echo "📤 Bot is LIVE! Executing heavy Telegram Backups safely in background..."
-          sleep 10 # Wait for n8n to boot and initialize DB fully
+          echo "Services stabilized. Exporting critical configurations..."
+          sleep 10 
           
           if [ -f n8n_data/database.sqlite ]; then
-              # Export n8n Data using standard shell commands (No JS syntax)
               docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json || true
               docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json || true
               
               cd n8n_data
               
-              # Zip and Send Secrets + Encryption Key
               if [ -f workflows.json ]; then
                   zip -P "$ZIP_PASS" n8n_secrets.zip creds_decrypted.json workflows.json || true
                   
-                  CAPTION1=$'📎 n8n_secrets.zip n8n Secrets Backup\nPassword: '"$ZIP_PASS"$'\n🔑 N8N Encryption Key: '"$N8N_KEY"
+                  CAPTION1=$'📎 Setup Package: n8n Configuration\nPassword: '"$ZIP_PASS"$'\n🔑 N8N Encryption Key: '"$N8N_KEY"
                   curl -s -F document=@n8n_secrets.zip -F caption="$CAPTION1" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID || true
               fi
               
-              # Send SQLite DB Backup
               sqlite3 database.sqlite 'VACUUM;' || true
               sqlite3 database.sqlite ".backup 'db_snap.sqlite'" || true
-              CAPTION2=$'📎 n8n_backup.sqlite Backup Saved (Start/Handover)\nTime: '$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+              CAPTION2=$'📎 Application Database\nTimestamp: '$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
               curl -s -F document=@db_snap.sqlite -F caption="$CAPTION2" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID || true
               
               rm -f creds_decrypted.json workflows.json n8n_secrets.zip db_snap.sqlite
           fi
 
       # ==================================================================
-      # [CONSTRAINT]: OBSERVER LOOP (n8n-First Freeze & Fast Exit)
+      # [PHASE 7]: SERVICE MONITOR & STATE SYNC (Graceful Shutdown Handler)
       # ==================================================================
-      - name: 🔄 Observer Loop
+      - name: 🔄 Service Monitor & State Sync
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
           cleanup() {
-              # Idempotency Lock: Prevent Double-Triggering
-              [ -f /tmp/backup_done ] && exit 0
-              touch /tmp/backup_done
+              # Concurrency Guard
+              [ -f /tmp/sync_lock ] && exit 0
+              touch /tmp/sync_lock
               
-              echo "🛑 KILL SIGNAL CAUGHT! Initiating Deep Freeze Handover..."
+              echo "🛑 Pre-emption Signal Received. Securing State..."
               
-              # 1. n8n-First Freeze (Max 3 Seconds to safely lock SQLite)
-              echo "🔒 Stopping n8n to safely lock database..."
+              # 1. Quiesce Database Node (3s grace period)
               docker stop -t 3 n8n || true
               
-              # 2. Instantly Cut Network (Zero Overlap for Sessions)
-              echo "🔪 Severing connections (wa-bot, cloudflared)..."
+              # 2. Terminate External Network Ingress
               docker kill cloudflared wa-bot || true
               
-              # 3. Fast Sync: Upload SQLite DB within the GitHub kill limit window
-              echo "💾 Uploading DB snapshot to Supabase (< 8s window)..."
-              timeout 8 node smart_sync.js up_fast || true
+              # 3. Synchronize Persistent Volume
+              timeout 8 node db_manager.js up_fast || true
               
-              echo "✅ Deep Freeze complete. Exiting smoothly."
+              echo "✅ State Sync complete. Exiting deployment runner."
               exit 0
           }
           
-          # Multi-Signal Trap
+          # Multi-Signal Trapping for GitHub Environments
           trap 'cleanup' SIGINT SIGTERM SIGHUP
           
           START=$(date +%s)
-          echo "🔄 Observer Active. Serving Clients..."
+          echo "System health monitoring active..."
           
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # Auto-Trigger Handover at 5h 50m (21000s)
+              # Enforce rolling update at 5h 50m
               if [ $DIFF -ge 21000 ]; then
-                  echo "⏰ Time limit reached. Triggering Auto-Handover..."
+                  echo "Deployment TTL reaching threshold. Provisioning new runner..."
                   gh workflow run main.yml
-                  # Short polling wait lets trap execute immediately upon receiving signal
+                  
+                  # Yield to new runner's termination signal
                   for i in {1..60}; do sleep 5; done 
                   exit 0
               fi
               
+              # Self-Healing Guards
               if ! docker ps | grep -q wa-bot; then docker restart wa-bot > /dev/null; fi
               if ! docker ps | grep -q n8n; then docker restart n8n > /dev/null; fi
               if ! docker ps | grep -q cloudflared; then docker restart cloudflared > /dev/null; fi
               
-              # Periodic Tasks (Every 15 mins)
+              # Routine State Backup (15 min intervals)
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
-                  node smart_sync.js up_full >/dev/null 2>&1 || true
+                  node db_manager.js up_full >/dev/null 2>&1 || true
               fi
-              sleep 60
+              
+              # Micro-Polling fix for immediate trap response (Replaces sleep 60)
+              for k in {1..12}; do sleep 5; done
           done
