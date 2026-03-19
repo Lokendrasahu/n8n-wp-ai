@@ -80,6 +80,7 @@ Add **exactly these 8 secrets**:
 | `N8N_ENCRYPTION_KEY` | Any strong custom password to encrypt your n8n credentials |
 | `SUPABASE_URL` | Your Supabase Project URL |
 | `SUPABASE_SERVICE_ROLE` | Supabase `service_role` secret key, **do not** use the public `anon` key |
+| `ZIP_PASSWORD` | Any strong password |
 | `TELEGRAM_BOT_TOKEN` | Bot token from `@BotFather` |
 | `TELEGRAM_CHAT_ID` | Your personal Telegram Chat ID from `@userinfobot` |
 
