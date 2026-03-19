@@ -1,4 +1,4 @@
-name: "Nexus Core: Multi-Vendor AI (Zero-Downtime)"
+name: "Nexus Core"
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
       # ==================================================================
       - name: ⚡ Optimize Environment & Setup
         run: |
-          sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          sudo fallocate -l 4G /swapfile || true && sudo chmod 600 /swapfile || true && sudo mkswap /swapfile || true && sudo swapon /swapfile || true
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
           sudo apt-get update && sudo apt-get install -y sqlite3 curl zip jq
           
@@ -91,9 +91,6 @@ jobs:
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}
         run: |
           cat << 'EOF' > smart_sync.js
           const { createClient } = require('@supabase/supabase-js');
@@ -340,7 +337,7 @@ jobs:
           curl -s -X POST https://api.telegram.org/bot$TG_TOKEN/sendMessage -d chat_id=$TG_ID -d text="🟢 <b>System Online @ nexusautomation.dpdns.org</b> (Start/Takeover Successful)" -d parse_mode="HTML"
 
       # ==================================================================
-      # [CONSTRAINT]: STARTUP TELEGRAM BACKUP (Includes n8n Key for Emergency)
+      # [CONSTRAINT]: STARTUP TELEGRAM BACKUP (Bash syntax corrected)
       # ==================================================================
       - name: 📩 Dispatch Telegram Backups & Keys
         env:
@@ -353,24 +350,24 @@ jobs:
           sleep 10 # Wait for n8n to boot and initialize DB fully
           
           if [ -f n8n_data/database.sqlite ]; then
-              # 1. Export n8n Data
-              try { docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json; } catch(e){}
-              try { docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json; } catch(e){}
+              # 1. Export n8n Data using Bash syntax (|| true handles errors without breaking)
+              docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows.json || true
+              docker exec n8n n8n export:credentials --all --decrypted --output=/home/node/.n8n/creds_decrypted.json || true
               
               cd n8n_data
               
               # 2. Zip and Send Secrets + Encryption Key
               if [ -f workflows.json ]; then
-                  zip -P "$ZIP_PASS" n8n_secrets.zip creds_decrypted.json workflows.json
+                  zip -P "$ZIP_PASS" n8n_secrets.zip creds_decrypted.json workflows.json || true
                   
                   CAPTION1=$'📎 n8n_secrets.zip n8n Secrets Backup\nPassword: '"$ZIP_PASS"$'\n🔑 N8N Encryption Key: '"$N8N_KEY"
-                  curl -s -F document=@n8n_secrets.zip -F caption="$CAPTION1" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID
+                  curl -s -F document=@n8n_secrets.zip -F caption="$CAPTION1" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID || true
               fi
               
               # 3. Send SQLite DB
-              sqlite3 database.sqlite 'VACUUM;'
+              sqlite3 database.sqlite 'VACUUM;' || true
               CAPTION2=$'📎 n8n_backup.sqlite Backup Saved (Start/Handover)\nTime: '$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
-              curl -s -F document=@database.sqlite -F caption="$CAPTION2" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID
+              curl -s -F document=@database.sqlite -F caption="$CAPTION2" https://api.telegram.org/bot$TG_TOKEN/sendDocument?chat_id=$TG_ID || true
               
               rm -f creds_decrypted.json workflows.json n8n_secrets.zip
           fi
