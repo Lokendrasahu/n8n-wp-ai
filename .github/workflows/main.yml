@@ -54,9 +54,18 @@ jobs:
           mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
           echo '{"name":"wa-node","dependencies":{"@whiskeysockets/baileys":"^6.7.0","axios":"^1.6.0","express":"^4.18.2","mongoose":"^8.0.0","pino":"^8.16.1","qrcode":"^1.5.3","node-cache":"^5.1.2"}}' > whatsapp/package.json
           
+          # 🚫 CONSTRAINT: Pre-declare n8n community nodes
+          echo '{"name":"n8n-community-nodes","dependencies":{"n8n-nodes-unlimited-fallback-agent":"^1.0.1"}}' > n8n_data/nodes/package.json
+          
           # Compiling essential native binaries
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git ffmpeg python3 make g++ libc6-compat && npm install"
           docker run --rm -v $(pwd)/n8n_data:/n8n_data -w /n8n_data node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install libsodium-wrappers"
+          
+          # 🚫 CONSTRAINT FIX: Compile Community Nodes inside Alpine container to prevent "Package Problem" UI binary mismatch errors
+          docker run --rm -v $(pwd)/n8n_data/nodes:/n8n_data/nodes -w /n8n_data/nodes node:20-alpine sh -c "apk add --no-cache python3 make g++ libc6-compat && npm install"
+          
+          # Fix permissions so n8n Docker user can access installed node_modules
+          sudo chmod -R 777 n8n_data
 
       # ==================================================================
       # [PHASE 3]: ZERO-DOWNTIME ROLLING UPDATE PROTOCOL
@@ -198,6 +207,7 @@ jobs:
             -e N8N_WORKFLOW_HISTORY_ENABLED=false \
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
+            -e N8N_COMMUNITY_PACKAGES_ENABLED=true \
             n8nio/n8n
 
           cat << 'EOF' > whatsapp/index.js
@@ -359,7 +369,7 @@ jobs:
       # ==================================================================
       - name: 🔄 Service Monitor & State Sync
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
