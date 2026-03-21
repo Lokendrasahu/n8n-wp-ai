@@ -179,15 +179,16 @@ jobs:
           mkdir -p n8n_data/nodes
           cd n8n_data/nodes
           
-          # Initialize package.json if it doesn't exist
           if [ ! -f package.json ]; then
             npm init -y
           fi
           
-          # [CONSTRAINT]: Auto-install Community Nodes before n8n boots
-          # This ensures nodes survive the 6-hour handover since Supabase only saves SQLite
+          # [CONSTRAINT]: Native C++ Compilation Bypass
+          # The flag '--legacy-peer-deps' tells NPM NOT to download 'n8n-workflow' and 'isolated-vm'.
+          # This prevents the C++ 'SourceLocation' build crash on Ubuntu hosts. 
+          # n8n naturally provides these dependencies from within its own Docker container at runtime.
           echo "Installing n8n-nodes-unlimited-fallback-agent..."
-          npm install n8n-nodes-unlimited-fallback-agent
+          npm install n8n-nodes-unlimited-fallback-agent --legacy-peer-deps --no-fund --no-audit
           
           cd ../..
           sudo chmod -R 777 n8n_data
